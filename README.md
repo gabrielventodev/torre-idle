@@ -10,6 +10,8 @@ Prototipo del MVP descrito en el documento de diseño. Godot 4.4, GDScript y ren
 
 ## Cómo se juega
 
+El turno se juega sobre un **radar 2D**: pistas, terminal con puertas y aviones con su estela. Haz clic en un avión (en el radar o en la lista de tráfico) para ver sus pasajeros, combustible y fase, y darle órdenes por radio; el piloto colaciona cada orden en el registro de radio.
+
 Cada día es un turno de 9:00 a 18:00 en el que llegan los aviones pedidos: 2 al principio y más con la mejora **Más tráfico**. Cada avión pasa por fases, como en una torre real, y cada fase pide una orden tuya:
 
 | Avión | Fases | Tus órdenes |
@@ -32,7 +34,8 @@ Reglas:
 | Archivo | Qué hace |
 | --- | --- |
 | `scripts/game.gd` | Autoload `Game`: fases de cada avión, pistas, estela, puertas, cobro, tienda, eventos, guardado. Sin UI. |
-| `scripts/main.gd` | Interfaz construida por código: pantallas de turno, cobro y tienda. |
+| `scripts/main.gd` | Interfaz construida por código: turno (radar + panel de radio), cobro y tienda. |
+| `scripts/radar_view.gd` | Dibuja el radar: pistas, terminal, barrido, aviones y estelas. Deriva posiciones de la fase de cada avión. |
 | `tests/pacing_sim.gd` | Bots que juegan solos para medir el ritmo de la economía. |
 
 Todos los números de balance están en las constantes al principio de `game.gd`.

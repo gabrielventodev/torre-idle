@@ -18,6 +18,7 @@ const SAVE_PATH := "user://save.json"
 ## Pago por avión coordinado según el nivel de radar.
 const PAY_BY_RADAR := [100, 250, 600, 1500]
 const MODEL_BY_RADAR := ["Cessna 208", "ATR 72", "A320", "B787"]
+const PAX_BY_RADAR := [9, 68, 180, 290]
 ## Categoría de estela: 0 ligera, 1 media, 2 pesada.
 const WAKE_BY_RADAR := [0, 1, 1, 2]
 const WAKE_NAMES := ["L", "M", "H"]
@@ -596,6 +597,7 @@ func _make_plane(is_arrival: bool, emergency: bool) -> Dictionary:
 		"arrival": is_arrival,
 		"tier": tier,
 		"model": MODEL_BY_RADAR[tier],
+		"pax": PAX_BY_RADAR[tier],
 		"wake": WAKE_BY_RADAR[tier],
 		"state": "approach" if is_arrival else "gate",
 		"timer": 0.0,
