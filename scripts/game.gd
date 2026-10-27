@@ -3,20 +3,40 @@ extends Node
 ## Se registra como autoload "Game". Los tests lo instancian con .new() y llaman a new_game().
 ##
 ## Bucle: turno de 9 a 18 (se coordinan los aviones pedidos ese día) -> cobro -> tienda -> siguiente día.
+##
+## Cada avión pasa por fases como en una torre real:
+##   Llegada: aproximación -> final (autorizado a una pista) -> aterrizaje -> rodaje -> puerta.
+##   Salida:  puerta -> push-back y rodaje -> punto de espera -> alineado en pista -> despegue.
+## Una pista solo admite una operación a la vez, y tras cada operación hay que respetar
+## la separación por estela turbulenta según el tamaño del avión anterior y el siguiente.
 
 signal toast(text: String)
 
 enum Phase { SHIFT, PAYDAY, SHOP }
 
 const SAVE_PATH := "user://save.json"
-## Pago por avión coordinado (aterrizaje o despegue) según el nivel de radar.
+## Pago por avión coordinado según el nivel de radar.
 const PAY_BY_RADAR := [100, 250, 600, 1500]
-const PAX_BY_RADAR := [10, 50, 180, 400]
 const MODEL_BY_RADAR := ["Cessna 208", "ATR 72", "A320", "B787"]
+## Categoría de estela: 0 ligera, 1 media, 2 pesada.
+const WAKE_BY_RADAR := [0, 1, 1, 2]
+const WAKE_NAMES := ["L", "M", "H"]
+## Segundos de separación exigidos [categoría anterior][categoría siguiente].
+const SEPARATION := [
+	[0.0, 0.0, 0.0],
+	[3.0, 0.0, 0.0],
+	[6.0, 4.0, 3.0],
+]
 const AIRLINES := ["IB", "VY", "UX", "AA", "LH", "AF", "KL", "LA", "AV", "AM"]
 const BASE_PLANES_PER_DAY := 2
-const BASE_OCCUPANCY := 2.5
-const MAX_QUEUE := 8
+const BASE_GATES := 2
+const FINAL_TIME := 6.0
+const LANDING_TIME := 3.0
+const TAKEOFF_TIME := 2.5
+const TAXI_TIME := 6.0
+const PUSHBACK_TIME := 3.0
+const TURNAROUND_TIME := 8.0
+const GO_AROUND_FUEL := 10.0
 const MAX_RUNWAYS := 4
 const MILESTONES := [10, 25, 50, 100]
 const SHIFT_START := 9.0
@@ -29,21 +49,25 @@ const UPGRADES := {
 		"desc": "+1 avión por turno"},
 	"fees": {"name": "Tasas aeroportuarias", "base": 200.0, "growth": 1.4, "max": -1,
 		"desc": "+15 % de pago por avión"},
-	"taxiway": {"name": "Calles de rodaje", "base": 300.0, "growth": 1.5, "max": 10,
-		"desc": "-10 % de tiempo de pista"},
-	"runway": {"name": "Pista adicional", "base": 400.0, "growth": 5.0, "max": MAX_RUNWAYS - 1,
-		"desc": "+1 operación simultánea"},
-	"intern": {"name": "Becario de torre", "base": 500.0, "growth": 1.5, "max": 8,
-		"desc": "Aprueba 1 avión cada 5 s"},
+	"gates": {"name": "Puerta de embarque", "base": 250.0, "growth": 1.6, "max": 7,
+		"desc": "+1 puerta para salidas y llegadas"},
+	"taxiway": {"name": "Calles de rodaje", "base": 300.0, "growth": 1.5, "max": 6,
+		"desc": "-15 % de tiempo de rodaje"},
+	"wake_monitor": {"name": "Monitor de estela", "base": 400.0, "growth": 1.0, "max": 1,
+		"desc": "Muestra la cuenta atrás de separación en cada pista"},
+	"rapid_exit": {"name": "Salida rápida de pista", "base": 500.0, "growth": 1.5, "max": 5,
+		"desc": "-10 % de ocupación de pista al aterrizar"},
+	"runway": {"name": "Pista adicional", "base": 2500.0, "growth": 8.0, "max": MAX_RUNWAYS - 1,
+		"desc": "+1 pista"},
 	"radar": {"name": "Radar", "base": 800.0, "growth": 6.0, "max": 3,
-		"desc": "Aviones más grandes que pagan más"},
-	"controller": {"name": "Controlador", "base": 3000.0, "growth": 1.5, "max": -1,
-		"desc": "Aprueba 1 avión cada 2 s, prioriza poco combustible"},
+		"desc": "Aviones más grandes: pagan más y dejan más estela"},
+	"ground": {"name": "Controlador de tierra", "base": 1500.0, "growth": 1.0, "max": 1,
+		"desc": "Hace el push-back de las salidas; la torre sigue siendo tuya"},
 }
 
 const XP_TREE := {
-	"start_controller": {"name": "Empezar con 1 controlador", "cost": 1},
-	"extra_traffic": {"name": "+2 aviones por turno", "cost": 2},
+	"start_ground": {"name": "Empezar con controlador de tierra", "cost": 1},
+	"extra_gates": {"name": "+2 puertas", "cost": 2},
 	"frequent_crisis": {"name": "Crisis más frecuentes", "cost": 2},
 }
 
@@ -64,21 +88,26 @@ var levels := {}
 var phase := Phase.SHOP
 
 # Estado del turno en curso.
-var arrivals: Array = []
-var departures: Array = []
+## Todos los aviones activos del turno, en orden de llegada.
+var planes: Array = []
 var runways: Array = []
+## Segundos restantes de escala de los aviones llegados que aún ocupan puerta.
+var turnarounds: Array = []
 var planes_total := 0
 var planes_spawned := 0
 var shift_elapsed := 0.0
 var shift_length := 0.0
 var day_pay := 0.0
+var day_fines := 0.0
 var day_landed := 0
+var day_departed := 0
 var day_diverted := 0
+var day_go_arounds := 0
+var day_infractions := 0
 var day_bonus := 0.0
 var last_summary := {}
 var _spawn_interval := 0.0
 var _spawn_timer := 0.0
-var _auto_acc := 0.0
 var _done_announced := false
 
 # Evento de crisis del día ("" si no hay). Como mucho uno por turno.
@@ -117,8 +146,8 @@ func reset_run() -> void:
 	levels = {}
 	for id in UPGRADES:
 		levels[id] = 0
-	if tree_owned.get("start_controller", false):
-		levels["controller"] = 1
+	if tree_owned.get("start_ground", false):
+		levels["ground"] = 1
 	start_shift()
 
 
@@ -135,11 +164,32 @@ func runway_count() -> int:
 	return 1 + levels["runway"]
 
 
-func occupancy() -> float:
-	var t: float = max(1.0, BASE_OCCUPANCY * pow(0.9, levels["taxiway"]))
-	if event_id == "storm":
-		t *= 2.0
-	return t
+func gate_count() -> int:
+	var n: int = BASE_GATES + levels["gates"]
+	if tree_owned.get("extra_gates", false):
+		n += 2
+	return n
+
+
+func gates_used() -> int:
+	var n := turnarounds.size()
+	for p in planes:
+		if p["state"] == "gate":
+			n += 1
+	return n
+
+
+func taxi_time() -> float:
+	return TAXI_TIME * pow(0.85, levels["taxiway"])
+
+
+func landing_time() -> float:
+	var t: float = LANDING_TIME * pow(0.9, levels["rapid_exit"])
+	return t * (1.5 if event_id == "storm" else 1.0)
+
+
+func takeoff_time() -> float:
+	return TAKEOFF_TIME * (1.5 if event_id == "storm" else 1.0)
 
 
 ## Multiplica x2 el efecto en cada hito (10, 25, 50, 100 unidades).
@@ -160,12 +210,6 @@ func pay_mult() -> float:
 
 func plane_value(plane: Dictionary) -> float:
 	return PAY_BY_RADAR[plane["tier"]] * pay_mult()
-
-
-func auto_rate() -> float:
-	var interns: float = 0.2 * levels["intern"]
-	var controllers: float = 0.5 * levels["controller"] * milestone_mult("controller")
-	return interns + controllers
 
 
 func upgrade_cost(id: String) -> float:
@@ -203,39 +247,121 @@ func planes_pending() -> int:
 	return planes_total - planes_spawned
 
 
-## El turno termina cuando no quedan aviones por llegar, en cola ni en pista.
+## El turno termina cuando no quedan aviones por llegar ni en movimiento.
 func shift_done() -> bool:
 	if phase != Phase.SHIFT or planes_spawned < planes_total or event_id != "":
 		return false
-	if not arrivals.is_empty() or not departures.is_empty():
+	if not planes.is_empty():
 		return false
 	for r in runways:
-		if r["time_left"] > 0.0:
+		if not r["op"].is_empty():
 			return false
 	return true
 
 
-# --- Acciones del jugador --------------------------------------------------
+## Segundos de separación que aún faltan en una pista para un avión de la categoría dada.
+func separation_left(runway: int, wake: int) -> float:
+	var r: Dictionary = runways[runway]
+	if r["prev_wake"] < 0:
+		return 0.0
+	return max(0.0, SEPARATION[r["prev_wake"]][wake] - r["since"])
+
+
+## Una pista está libre si no hay nadie rodando por ella ni alineado.
+func runway_clear(runway: int) -> bool:
+	var r: Dictionary = runways[runway]
+	return r["op"].is_empty() and r["lined"].is_empty()
+
+
+func arrivals() -> Array:
+	return planes.filter(func(p): return p["arrival"])
+
+
+func departures() -> Array:
+	return planes.filter(func(p): return not p["arrival"])
+
+
+## Aviones en final hacia una pista (autorizados a aterrizar y aún en el aire).
+func finals_on(runway: int) -> Array:
+	return planes.filter(func(p): return p["state"] == "final" and p["runway"] == runway)
+
+
+# --- Acciones del jugador: turno -------------------------------------------
+
+## Autoriza a un avión en aproximación a aterrizar en una pista. Toca pista en FINAL_TIME s;
+## si para entonces la pista está ocupada, hace motor y al aire.
+func clear_landing(plane_id: int, runway: int) -> bool:
+	var p := _find(plane_id)
+	if p.is_empty() or p["state"] != "approach" or runway < 0 or runway >= runways.size():
+		return false
+	p["state"] = "final"
+	p["runway"] = runway
+	p["timer"] = FINAL_TIME
+	return true
+
+
+## Push-back y rodaje hasta el punto de espera. Libera la puerta.
+func push_back(plane_id: int) -> bool:
+	var p := _find(plane_id)
+	if p.is_empty() or p["state"] != "gate":
+		return false
+	p["state"] = "taxi_out"
+	p["timer"] = PUSHBACK_TIME + taxi_time()
+	return true
+
+
+## Entrar y esperar: el avión ocupa la pista hasta que se le autorice el despegue.
+func line_up(plane_id: int, runway: int) -> bool:
+	var p := _find(plane_id)
+	if p.is_empty() or p["state"] != "holding" or runway < 0 or runway >= runways.size():
+		return false
+	if not runway_clear(runway):
+		return false
+	p["state"] = "lined_up"
+	p["runway"] = runway
+	runways[runway]["lined"] = p
+	return true
+
+
+## Autoriza el despegue de un avión alineado. Si no se respeta la separación por estela,
+## despega igual pero se registra una infracción con multa.
+func clear_takeoff(plane_id: int) -> bool:
+	var p := _find(plane_id)
+	if p.is_empty() or p["state"] != "lined_up":
+		return false
+	var r: Dictionary = runways[p["runway"]]
+	if separation_left(p["runway"], p["wake"]) > 0.0:
+		_infraction(p, "despegó sin separación por estela")
+	r["lined"] = {}
+	r["op"] = p
+	r["op_left"] = takeoff_time()
+	p["state"] = "takeoff"
+	return true
+
+
+# --- Acciones del jugador: entre turnos -----------------------------------
 
 func start_shift() -> void:
 	phase = Phase.SHIFT
-	arrivals.clear()
-	departures.clear()
+	planes.clear()
+	turnarounds.clear()
 	runways.clear()
 	for i in runway_count():
-		runways.append({"time_left": 0.0, "plane": {}, "vip": false})
+		runways.append({"op": {}, "op_left": 0.0, "lined": {}, "prev_wake": -1, "since": 0.0})
 	planes_total = planes_per_day()
 	planes_spawned = 0
-	# El día dura más con más aviones, pero siempre llegan seguidos para no esperar en vacío.
-	_spawn_interval = clamp(20.0 / planes_total, 0.8, 5.0)
+	_spawn_interval = clamp(24.0 / planes_total, 1.5, 6.0)
 	_spawn_timer = 0.5
 	shift_elapsed = 0.0
-	shift_length = _spawn_interval * planes_total + 8.0
+	shift_length = _spawn_interval * planes_total + 25.0
 	day_pay = 0.0
+	day_fines = 0.0
 	day_landed = 0
+	day_departed = 0
 	day_diverted = 0
+	day_go_arounds = 0
+	day_infractions = 0
 	day_bonus = 0.0
-	_auto_acc = 0.0
 	_done_announced = false
 	event_id = ""
 	_storm_won = false
@@ -250,8 +376,10 @@ func end_day() -> bool:
 	if _storm_won:
 		day_bonus += day_pay * 0.5
 	last_summary = {
-		"day": day, "landed": day_landed, "diverted": day_diverted,
-		"pay": day_pay, "bonus": day_bonus, "total": day_pay + day_bonus,
+		"day": day, "landed": day_landed, "departed": day_departed, "diverted": day_diverted,
+		"go_arounds": day_go_arounds, "infractions": day_infractions,
+		"pay": day_pay, "bonus": day_bonus, "fines": day_fines,
+		"total": max(0.0, day_pay + day_bonus - day_fines),
 	}
 	phase = Phase.PAYDAY
 	return true
@@ -283,33 +411,6 @@ func buy(id: String) -> bool:
 		return false
 	money -= upgrade_cost(id)
 	levels[id] += 1
-	return true
-
-
-## Aprobación manual de un avión de cualquiera de las dos colas.
-func approve(plane_id: int) -> bool:
-	var runway := _free_runway()
-	if runway < 0:
-		return false
-	for queue in [arrivals, departures]:
-		for plane in queue:
-			if plane["id"] == plane_id:
-				queue.erase(plane)
-				_assign(plane, runway)
-				if plane["emergency"] and event_id == "emergency":
-					_end_event(true, plane_value(plane) * 3.0)
-				return true
-	return false
-
-
-## Evento VIP: reserva una pista libre durante 10 s.
-func reserve_vip() -> bool:
-	if event_id != "vip" or _any_vip_runway():
-		return false
-	var runway := _free_runway()
-	if runway < 0:
-		return false
-	runways[runway] = {"time_left": 10.0, "plane": {}, "vip": true}
 	return true
 
 
@@ -346,76 +447,126 @@ func simulate(delta: float) -> void:
 		return
 	shift_elapsed += delta
 	_update_runways(delta)
-	_update_queues(delta)
+	_update_planes(delta)
+	_update_turnarounds(delta)
 	_spawn(delta)
-	_automate(delta)
+	_ground_control()
 	_update_event(delta)
 	if not _done_announced and shift_done():
 		_done_announced = true
 		toast.emit("Torre: no vienen más aviones hoy. Puedes terminar el día.")
 
 
-func _free_runway() -> int:
-	for i in runways.size():
-		if runways[i]["time_left"] <= 0.0:
-			return i
-	return -1
-
-
-func _any_vip_runway() -> bool:
-	for r in runways:
-		if r["vip"]:
-			return true
-	return false
-
-
-func _assign(plane: Dictionary, runway: int) -> void:
-	runways[runway] = {"time_left": occupancy(), "plane": plane, "vip": false}
+func _find(plane_id: int) -> Dictionary:
+	for p in planes:
+		if p["id"] == plane_id:
+			return p
+	return {}
 
 
 func _update_runways(delta: float) -> void:
 	for r in runways:
-		if r["time_left"] <= 0.0:
+		r["since"] += delta
+		if r["op"].is_empty():
 			continue
-		r["time_left"] -= delta
-		if r["time_left"] > 0.0:
+		r["op_left"] -= delta
+		if r["op_left"] > 0.0:
 			continue
-		r["time_left"] = 0.0
-		if r["vip"]:
-			r["vip"] = false
-			if event_id == "vip":
-				_end_event(true, PAY_BY_RADAR[levels["radar"]] * pay_mult() * 5.0)
-		elif not r["plane"].is_empty():
-			_complete(r["plane"])
-			r["plane"] = {}
+		var p: Dictionary = r["op"]
+		r["op"] = {}
+		r["prev_wake"] = p["wake"]
+		r["since"] = 0.0
+		if p["arrival"]:
+			p["state"] = "taxi_in"
+			p["timer"] = taxi_time()
+		else:
+			_pay(p)
+			day_departed += 1
+			planes.erase(p)
 
 
-## El pago se acumula y se cobra al terminar el día.
-func _complete(plane: Dictionary) -> void:
-	var pay: float = plane_value(plane)
-	if not plane["arrival"]:
-		pay *= max(0.2, 1.0 - 0.1 * floor(plane["wait"] / 10.0))
-	day_pay += pay
-	day_landed += 1
+func _update_planes(delta: float) -> void:
+	for p in planes.duplicate():
+		p["wait"] += delta
+		match p["state"]:
+			"approach":
+				p["fuel"] -= delta
+				if p["fuel"] <= 0.0:
+					_divert(p)
+			"final":
+				p["fuel"] -= delta
+				p["timer"] -= delta
+				if p["timer"] <= 0.0:
+					_touchdown(p)
+			"taxi_in":
+				p["timer"] -= delta
+				if p["timer"] <= 0.0:
+					p["state"] = "wait_gate"
+			"taxi_out":
+				p["timer"] -= delta
+				if p["timer"] <= 0.0:
+					p["state"] = "holding"
+		if p["state"] == "wait_gate" and gates_used() < gate_count():
+			_pay(p)
+			day_landed += 1
+			turnarounds.append(TURNAROUND_TIME)
+			planes.erase(p)
+			if p["emergency"] and event_id == "emergency":
+				_end_event(true, plane_value(p) * 3.0)
 
 
-func _update_queues(delta: float) -> void:
-	for plane in departures:
-		plane["wait"] += delta
-	for plane in arrivals.duplicate():
-		plane["wait"] += delta
-		plane["fuel"] -= delta
-		if plane["fuel"] > 0.0:
-			continue
-		arrivals.erase(plane)
-		if plane["emergency"]:
-			if event_id == "emergency":
-				_end_event(false, 0.0)
-			continue
-		day_diverted += 1
+func _touchdown(p: Dictionary) -> void:
+	var runway: int = p["runway"]
+	var r: Dictionary = runways[runway]
+	if not runway_clear(runway):
+		# Pista ocupada: motor y al aire, vuelve a la aproximación con menos combustible.
+		p["state"] = "approach"
+		p["runway"] = -1
+		p["fuel"] -= GO_AROUND_FUEL
+		day_go_arounds += 1
+		day_fines += plane_value(p) * 0.25
 		if event_id == "storm":
 			event_success = false
-		toast.emit("%s se desvió por falta de combustible." % plane["callsign"])
+		toast.emit("%s: motor y al aire, la pista %d estaba ocupada." % [p["callsign"], runway + 1])
+		return
+	if separation_left(runway, p["wake"]) > 0.0:
+		_infraction(p, "aterrizó sin separación por estela")
+	p["state"] = "landing"
+	r["op"] = p
+	r["op_left"] = landing_time()
+
+
+func _infraction(p: Dictionary, what: String) -> void:
+	day_infractions += 1
+	day_fines += plane_value(p) * 0.5
+	toast.emit("Infracción: %s %s. Multa de %s $." % [p["callsign"], what, format_number(plane_value(p) * 0.5)])
+
+
+func _divert(p: Dictionary) -> void:
+	planes.erase(p)
+	if p["emergency"]:
+		if event_id == "emergency":
+			_end_event(false, 0.0)
+		return
+	day_diverted += 1
+	if event_id == "storm":
+		event_success = false
+	toast.emit("%s se desvió por falta de combustible." % p["callsign"])
+
+
+## Paga un avión; las salidas pierden un 10 % por cada 10 s de espera por encima de 30 s.
+func _pay(p: Dictionary) -> void:
+	var pay := plane_value(p)
+	var late: float = max(0.0, p["wait"] - (60.0 if p["arrival"] else 30.0))
+	pay *= max(0.3, 1.0 - 0.1 * floor(late / 10.0))
+	day_pay += pay
+
+
+func _update_turnarounds(delta: float) -> void:
+	for i in range(turnarounds.size() - 1, -1, -1):
+		turnarounds[i] -= delta
+		if turnarounds[i] <= 0.0:
+			turnarounds.remove_at(i)
 
 
 func _spawn(delta: float) -> void:
@@ -424,17 +575,12 @@ func _spawn(delta: float) -> void:
 	_spawn_timer -= delta
 	if _spawn_timer > 0.0:
 		return
-	var is_arrival := rng.randf() < 0.5
-	var queue := arrivals if is_arrival else departures
-	if queue.size() >= MAX_QUEUE:
-		queue = departures if is_arrival else arrivals
-		is_arrival = not is_arrival
-	if queue.size() >= MAX_QUEUE:
-		_spawn_timer = 0.5
-		return
-	queue.append(_make_plane(is_arrival, false))
+	# Las salidas nacen en una puerta: si no hay puerta libre, llega una llegada en su lugar.
+	var is_arrival := rng.randf() < 0.5 or gates_used() >= gate_count()
+	planes.append(_make_plane(is_arrival, false))
 	planes_spawned += 1
-	_spawn_timer = _spawn_interval
+	# Llegan en oleadas irregulares, como los bancos de un aeropuerto real.
+	_spawn_timer = _spawn_interval * rng.randf_range(0.3, 1.7)
 	if planes_spawned == planes_total:
 		toast.emit("Último avión del día en camino.")
 
@@ -442,16 +588,19 @@ func _spawn(delta: float) -> void:
 func _make_plane(is_arrival: bool, emergency: bool) -> Dictionary:
 	# Con más radar, la mayoría de aviones son del tamaño máximo desbloqueado.
 	var tier: int = levels["radar"]
-	if tier > 0 and rng.randf() < 0.35:
-		tier -= 1
+	if tier > 0 and rng.randf() < 0.4:
+		tier = rng.randi_range(0, tier - 1)
 	var plane := {
 		"id": _next_plane_id,
 		"callsign": "%s%d" % [AIRLINES[rng.randi() % AIRLINES.size()], rng.randi_range(100, 9999)],
 		"arrival": is_arrival,
 		"tier": tier,
-		"pax": PAX_BY_RADAR[tier],
 		"model": MODEL_BY_RADAR[tier],
-		"fuel": 10.0 if emergency else rng.randf_range(18.0, 35.0),
+		"wake": WAKE_BY_RADAR[tier],
+		"state": "approach" if is_arrival else "gate",
+		"timer": 0.0,
+		"runway": -1,
+		"fuel": 15.0 if emergency else rng.randf_range(20.0, 35.0),
 		"wait": 0.0,
 		"emergency": emergency,
 	}
@@ -459,33 +608,17 @@ func _make_plane(is_arrival: bool, emergency: bool) -> Dictionary:
 	return plane
 
 
-func _automate(delta: float) -> void:
-	_auto_acc += auto_rate() * delta
-	while _auto_acc >= 1.0:
-		var runway := _free_runway()
-		var plane := _pick_for_auto()
-		if runway < 0 or plane.is_empty():
-			# No se acumulan aprobaciones mientras no hay pista o avión.
-			_auto_acc = min(_auto_acc, 1.0)
+## El controlador de tierra hace el push-back sin saturar el punto de espera.
+func _ground_control() -> void:
+	if levels["ground"] == 0:
+		return
+	var holding := planes.filter(func(p): return p["state"] in ["taxi_out", "holding"]).size()
+	for p in planes:
+		if holding >= runways.size() + 1:
 			return
-		_auto_acc -= 1.0
-		(arrivals if plane["arrival"] else departures).erase(plane)
-		_assign(plane, runway)
-
-
-## La automatización nunca atiende emergencias: son decisión del jugador.
-func _pick_for_auto() -> Dictionary:
-	var best := {}
-	if levels["controller"] > 0:
-		for plane in arrivals:
-			if not plane["emergency"] and plane["fuel"] < 15.0 and (best.is_empty() or plane["fuel"] < best["fuel"]):
-				best = plane
-		if not best.is_empty():
-			return best
-	for plane in arrivals + departures:
-		if not plane["emergency"] and (best.is_empty() or plane["wait"] > best["wait"]):
-			best = plane
-	return best
+		if p["state"] == "gate":
+			push_back(p["id"])
+			holding += 1
 
 
 # --- Eventos de crisis -----------------------------------------------------
@@ -494,12 +627,12 @@ func _update_event(delta: float) -> void:
 	if event_id == "":
 		if _event_at >= 0.0 and shift_elapsed >= _event_at:
 			_event_at = -1.0
-			_start_event(["storm", "emergency", "vip"][rng.randi() % 3])
+			_start_event(["storm", "emergency"][rng.randi() % 2])
 		return
 	event_time -= delta
-	if event_time <= 0.0 and event_id != "emergency":
-		# La tormenta se gana sobreviviéndola sin desvíos; el VIP caduca si no se atiende.
-		if event_id == "storm" and event_success:
+	if event_time <= 0.0 and event_id == "storm":
+		# La tormenta se gana sobreviviéndola sin desvíos ni motores y al aire.
+		if event_success:
 			_storm_won = true
 			toast.emit("Tormenta superada: +50 % de pago hoy.")
 			_end_event(true, 0.0)
@@ -512,15 +645,11 @@ func _start_event(id: String) -> void:
 	event_success = true
 	match id:
 		"storm":
-			event_time = 20.0
-			toast.emit("Tormenta: las pistas rinden la mitad 20 s. Sin desvíos, +50 % de pago hoy.")
+			event_time = 25.0
+			toast.emit("Tormenta: las pistas tardan un 50 % más durante 25 s. Sin desvíos ni motores y al aire, +50 % de pago hoy.")
 		"emergency":
-			event_time = 10.0
-			arrivals.push_front(_make_plane(true, true))
-			toast.emit("Emergencia médica: aprueba el avión marcado en menos de 10 s.")
-		"vip":
-			event_time = 20.0
-			toast.emit("Vuelo VIP: reserva una pista durante 10 s para cobrar un extra.")
+			planes.push_front(_make_plane(true, true))
+			toast.emit("Emergencia médica: aterriza el avión marcado antes de que se quede sin combustible.")
 
 
 func _end_event(success: bool, bonus: float) -> void:
@@ -530,11 +659,8 @@ func _end_event(success: bool, bonus: float) -> void:
 		toast.emit("La crisis pasó sin bonificación.")
 		return
 	day_bonus += bonus
-	match id:
-		"emergency":
-			toast.emit("Emergencia resuelta: bonificación de %s $." % format_number(bonus))
-		"vip":
-			toast.emit("Vuelo VIP atendido: bonificación de %s $." % format_number(bonus))
+	if id == "emergency":
+		toast.emit("Emergencia resuelta: bonificación de %s $." % format_number(bonus))
 
 
 # --- Guardado ---------------------------------------------------------------
@@ -542,7 +668,7 @@ func _end_event(success: bool, bonus: float) -> void:
 ## Se guarda entre turnos; un turno a medias se reinicia al volver.
 func to_dict() -> Dictionary:
 	return {
-		"version": 2,
+		"version": 3,
 		"xp_available": xp_available, "xp_total": xp_total,
 		"airport_level": airport_level, "tree_owned": tree_owned,
 		"money": money, "run_money": run_money, "day": day, "levels": levels,
@@ -574,7 +700,7 @@ func load_game() -> bool:
 	if not FileAccess.file_exists(SAVE_PATH):
 		return false
 	var data = JSON.parse_string(FileAccess.get_file_as_string(SAVE_PATH))
-	if typeof(data) != TYPE_DICTIONARY or int(data.get("version", 0)) != 2:
+	if typeof(data) != TYPE_DICTIONARY or int(data.get("version", 0)) != 3:
 		return false
 	from_dict(data)
 	return true
