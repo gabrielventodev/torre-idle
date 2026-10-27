@@ -1,0 +1,5 @@
+# Caché del editor de Godot
+.godot/
+# Exportaciones
+build/
+*.tmp
