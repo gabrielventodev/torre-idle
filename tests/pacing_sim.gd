@@ -25,7 +25,7 @@ func _run(label: String, actions_per_s: float, careful: bool) -> void:
 	g.new_game()
 	var real_time := 0.0
 	var act_acc := 0.0
-	var totals := {"diverted": 0, "go_arounds": 0, "infractions": 0}
+	var totals := {"diverted": 0, "go_arounds": 0, "infractions": 0, "crashes": 0}
 	print("\n== %s ==" % label)
 	while g.day <= MAX_DAYS:
 		var shift_time := 0.0
@@ -38,6 +38,8 @@ func _run(label: String, actions_per_s: float, careful: bool) -> void:
 		real_time += shift_time
 		if not g.end_day():
 			print("  día %d no terminó (bloqueado)" % g.day)
+			for p in g.planes:
+				print("    %s %s pos %s alt %d ruta %s" % [p["callsign"], p["state"], p["pos"], p["alt"], p["path"]])
 			break
 		var s: Dictionary = g.last_summary
 		for k in totals:
@@ -68,46 +70,44 @@ func _act(g, careful: bool) -> bool:
 	# 1. Despegar a quien esté alineado y con separación cumplida.
 	for p in g.planes:
 		if p["state"] == "lined_up" and (not careful or g.separation_left(p["runway"], p["wake"]) <= 0.0):
-			if g.finals_on(p["runway"]).is_empty() or true:
-				return g.clear_takeoff(p["id"])
-	# 2. Autorizar aterrizaje a la llegada con menos combustible en una pista que estará libre.
+			return g.clear_takeoff(p["id"])
+	# 2. Entrantes: esperar a una altitud que no use ningún otro avión en vuelo.
+	for p in g.planes:
+		if p["state"] == "inbound":
+			var used := []
+			for q in g.planes:
+				if q != p and g.is_airborne(q):
+					used.append(int(q["target_alt"]))
+			for alt in g.HOLD_ALTITUDES:
+				if not alt in used:
+					return g.hold_at(p["id"], alt)
+	# 3. Autorizar aterrizaje a la llegada en espera con menos combustible, en una pista sin tráfico.
 	var arrival := {}
 	for p in g.planes:
-		if p["state"] == "approach" and (p["emergency"] or arrival.is_empty() or p["fuel"] < arrival["fuel"]):
+		if p["state"] == "holding" and (p["emergency"] or arrival.is_empty() or p["fuel"] < arrival["fuel"]):
 			arrival = p
 			if p["emergency"]:
 				break
 	if not arrival.is_empty():
 		for i in g.runways.size():
-			if _runway_free_for_landing(g, i, arrival, careful):
+			if g.runways[i]["lined"].is_empty() and g.approaches_on(i).is_empty() and g.runways[i]["op"].is_empty():
 				return g.clear_landing(arrival["id"], i)
-	# 3. Alinear salidas en pistas sin nadie en final.
+	# 4. Alinear salidas en pistas sin aproximaciones cercanas.
 	for p in g.planes:
-		if p["state"] == "holding":
+		if p["state"] == "hold_point":
 			for i in g.runways.size():
-				if g.runway_clear(i) and g.finals_on(i).is_empty():
+				if g.runway_clear(i) and g.approaches_on(i).filter(func(a): return g.time_to_touchdown(a) < 12.0).is_empty():
 					return g.line_up(p["id"], i)
-	# 4. Push-back si el punto de espera no está saturado.
+	# 5. Push-back si el punto de espera no está saturado.
 	var queued := 0
 	for p in g.planes:
-		if p["state"] in ["taxi_out", "holding"]:
+		if p["state"] in ["pushback", "hold_point"]:
 			queued += 1
 	if queued <= g.runways.size():
 		for p in g.planes:
 			if p["state"] == "gate":
 				return g.push_back(p["id"])
 	return false
-
-
-func _runway_free_for_landing(g, i: int, plane: Dictionary, careful: bool) -> bool:
-	var r: Dictionary = g.runways[i]
-	if not r["lined"].is_empty() or not g.finals_on(i).is_empty():
-		return false
-	if not r["op"].is_empty() and r["op_left"] > g.FINAL_TIME:
-		return false
-	if careful and g.separation_left(i, plane["wake"]) > g.FINAL_TIME:
-		return false
-	return true
 
 
 func _cheapest(g) -> String:

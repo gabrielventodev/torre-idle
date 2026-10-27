@@ -1,5 +1,5 @@
 extends Control
-## Interfaz de la torre con tres pantallas: turno (radar + radio), cobro y tienda.
+## Interfaz de la torre con tres pantallas: turno (mapa + radio), cobro y tienda.
 ## Se construye por código para que el prototipo sea fácil de modificar; los botones se
 ## reutilizan en vez de recrearse para no perder clics entre refrescos.
 
@@ -11,7 +11,8 @@ const COLOR_EMERGENCY := Color("ffb347")
 const COLOR_MUTED := Color("8a96a3")
 const TRAFFIC_ROWS := 14
 const RADIO_LINES := 8
-const RadarView := preload("res://scripts/radar_view.gd")
+const MapView := preload("res://scripts/map_view.gd")
+const ACTION_BUTTONS := 10
 
 var _status_label: Label
 var _shift_view: VBoxContainer
@@ -103,7 +104,7 @@ func _build_shift_view(parent: Node) -> VBoxContainer:
 	body.add_theme_constant_override("separation", 12)
 	view.add_child(body)
 
-	_radar = RadarView.new()
+	_radar = MapView.new()
 	_radar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_radar.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_radar.plane_selected.connect(func(_id): pass)
@@ -119,7 +120,7 @@ func _build_shift_view(parent: Node) -> VBoxContainer:
 	_selected_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	var actions := HFlowContainer.new()
 	side.add_child(actions)
-	for j in Game.MAX_RUNWAYS:
+	for j in ACTION_BUTTONS:
 		var b := Button.new()
 		b.add_theme_font_size_override("font_size", 13)
 		b.pressed.connect(func(): _on_action(b))
@@ -233,6 +234,7 @@ func _on_action(b: Button) -> void:
 	var action: String = b.get_meta("action", "")
 	var p: Dictionary = Game._find(b.get_meta("plane_id", -1))
 	var runway: int = b.get_meta("runway", -1)
+	var altitude: int = b.get_meta("altitude", 0)
 	if p.is_empty():
 		return
 	var cs: String = p["callsign"]
@@ -240,6 +242,10 @@ func _on_action(b: Button) -> void:
 	var order := ""
 	var readback := ""
 	match action:
+		"hold":
+			ok = Game.hold_at(p["id"], altitude)
+			order = "%s, mantenga %d pies y espere en circuito donde está." % [cs, altitude]
+			readback = "Mantenemos %d pies en espera, %s." % [altitude, cs]
 		"land":
 			ok = Game.clear_landing(p["id"], runway)
 			order = "%s, pista %d, autorizado a aterrizar." % [cs, runway + 1]
@@ -295,7 +301,7 @@ func _refresh_shift() -> void:
 
 	var event_text := ""
 	match Game.event_id:
-		"storm": event_text = "TORMENTA %ds · las pistas tardan más, evita desvíos y motores y al aire" % ceil(Game.event_time)
+		"storm": event_text = "TORMENTA %ds · las tomas son más lentas, evita desvíos y motores y al aire" % ceil(Game.event_time)
 		"emergency": event_text = "EMERGENCIA · aterriza el avión naranja cuanto antes"
 	if Game.shift_done():
 		event_text = "Torre: no vienen más aviones hoy. Puedes terminar el día."
@@ -314,7 +320,7 @@ func _refresh_shift() -> void:
 			state = "%s alineado" % r["lined"]["callsign"]
 		lines.append("P%d: %s" % [i + 1, state])
 	lines.append("Puertas ocupadas: %d de %d" % [Game.gates_used(), Game.gate_count()])
-	lines.append("Estela: tras H esperar 6 s a L, 4 s a M y 3 s a H; tras M, 3 s a L. Un aterrizaje toca pista %d s después de autorizarlo." % Game.FINAL_TIME)
+	lines.append("Dos aviones en el mismo sitio y a la misma altitud chocan y pierdes todo el dinero; el círculo rojo avisa del conflicto. Estela: tras H esperar 6 s a L, 4 s a M y 3 s a H; tras M, 3 s a L.")
 	_airport_label.text = "\n".join(lines)
 
 
@@ -347,24 +353,30 @@ func _refresh_traffic() -> void:
 		var c := COLOR_ARRIVAL if p["arrival"] else COLOR_DEPARTURE
 		if p["emergency"]:
 			c = COLOR_EMERGENCY
-		elif p["state"] in ["approach", "final"] and p["fuel"] < 10.0:
+		elif p["arrival"] and Game.is_airborne(p) and p["fuel"] < 15.0:
 			c = COLOR_WARN
 		b.add_theme_color_override("font_color", c)
 		b.add_theme_color_override("font_hover_color", c)
 
 
 func _state_text(p: Dictionary) -> String:
+	var alt := "%d ft" % int(round(p["alt"] / 100.0) * 100)
 	match p["state"]:
-		"approach": return "aproximación, combustible %ds" % ceil(p["fuel"])
-		"final": return "final P%d, toca en %.1fs" % [p["runway"] + 1, p["timer"]]
-		"landing": return "aterrizando en P%d" % (p["runway"] + 1)
-		"taxi_in": return "rodando a puerta %.0fs" % p["timer"]
+		"inbound": return "entrante a %s, combustible %ds. Asígnale altitud de espera." % [alt, ceil(p["fuel"])]
+		"holding": return "en espera a %s (asignada %d), combustible %ds" % [alt, int(p["target_alt"]), ceil(p["fuel"])]
+		"approach": return "aproximación a P%d, %s, toma en %.0fs" % [p["runway"] + 1, alt, Game.time_to_touchdown(p)]
+		"go_around": return "motor y al aire, subiendo a %d ft" % Game.GO_AROUND_ALT
+		"landing": return "carrera de aterrizaje en P%d" % (p["runway"] + 1)
+		"taxi_in": return "rodando a puerta"
 		"wait_gate": return "esperando puerta libre"
 		"gate": return "en puerta, espera %ds" % int(p["wait"])
-		"taxi_out": return "push-back y rodaje %.0fs" % p["timer"]
-		"holding": return "en punto de espera"
+		"pushback": return "push-back y rodaje al punto de espera"
+		"hold_point": return "en punto de espera"
+		"line_up": return "entrando en P%d" % (p["runway"] + 1)
 		"lined_up": return "alineado en P%d" % (p["runway"] + 1)
-		"takeoff": return "despegando de P%d" % (p["runway"] + 1)
+		"takeoff": return "carrera de despegue en P%d" % (p["runway"] + 1)
+		"climb": return "despegado, ascenso a %s" % alt
+		"divert": return "desviándose a otro aeropuerto"
 	return p["state"]
 
 
@@ -373,12 +385,14 @@ func _fill_actions(p: Dictionary) -> void:
 	var actions := []
 	if not p.is_empty():
 		match p["state"]:
-			"approach":
+			"inbound", "holding":
+				for alt in Game.HOLD_ALTITUDES:
+					actions.append(["hold", -1, "Esperar a %d ft" % alt, int(p["target_alt"]) != alt or p["state"] == "inbound", alt])
 				for r in Game.runways.size():
 					actions.append(["land", r, "Autorizar aterrizaje P%d" % (r + 1), true])
 			"gate":
 				actions.append(["push", -1, "Aprobar push-back", true])
-			"holding":
+			"hold_point":
 				for r in Game.runways.size():
 					actions.append(["line_up", r, "Entrar y esperar P%d" % (r + 1), Game.runway_clear(r)])
 			"lined_up":
@@ -395,6 +409,7 @@ func _fill_actions(p: Dictionary) -> void:
 		b.set_meta("action", a[0])
 		b.set_meta("plane_id", p["id"])
 		b.set_meta("runway", a[1])
+		b.set_meta("altitude", a[4] if a.size() > 4 else 0)
 
 
 func _refresh_payday() -> void:
@@ -406,6 +421,8 @@ func _refresh_payday() -> void:
 		text += "\nBonificación por crisis: %s $" % Game.format_number(s["bonus"])
 	if s["fines"] > 0.0:
 		text += "\nMultas: -%s $" % Game.format_number(s["fines"])
+	if s["crashes"] > 0:
+		text += "\nColisiones: %d (se perdió todo el dinero)" % s["crashes"]
 	text += "\n\nTotal: %s $" % Game.format_number(s["total"])
 	_summary_label.text = text
 

@@ -10,32 +10,36 @@ Prototipo del MVP descrito en el documento de diseño. Godot 4.4, GDScript y ren
 
 ## Cómo se juega
 
-El turno se juega sobre un **radar 2D**: pistas, terminal con puertas y aviones con su estela. Haz clic en un avión (en el radar o en la lista de tráfico) para ver sus pasajeros, combustible y fase, y darle órdenes por radio; el piloto colaciona cada orden en el registro de radio.
+El turno se juega sobre un **tablero del aeropuerto visto desde arriba**: pistas, calles de rodaje, terminal con puertas y aviones que se mueven de verdad por el mapa (sin saltos). La etiqueta de cada avión muestra indicativo y altitud en cientos de pies (`040` = 4000 ft). Haz clic en un avión (en el mapa o en la lista de tráfico) para ver pasajeros, combustible y fase, y darle órdenes por radio; el piloto colaciona cada orden.
 
-Cada día es un turno de 9:00 a 18:00 en el que llegan los aviones pedidos: 2 al principio y más con la mejora **Más tráfico**. Cada avión pasa por fases, como en una torre real, y cada fase pide una orden tuya:
+Cada día es un turno de 9:00 a 18:00 en el que llegan los aviones pedidos: 2 al principio y más con la mejora **Más tráfico**.
 
-| Avión | Fases | Tus órdenes |
+| Avión | Recorrido | Tus órdenes |
 | --- | --- | --- |
-| Llegada | aproximación → final → aterrizaje → rodaje → puerta | **Aterrizar Pn** |
-| Salida | puerta → push-back y rodaje → punto de espera → alineado → despegue | **Push-back**, **Entrar Pn**, **Despegar** |
+| Llegada | entra por el borde → espera en circuito → tramo base → final → toma → rodaje → puerta | **Mantener 3000-7000 ft**, **Aterrizar Pn** |
+| Salida | puerta → push-back → rodaje al punto de espera → alineado → despegue → sale del mapa | **Push-back**, **Entrar Pn**, **Despegar** |
 
 Reglas:
-- **Una pista, una operación.** Un avión autorizado a aterrizar toca tierra 6 s después. Si en ese momento la pista está ocupada (otro avión rodando o alineado), hace **motor y al aire**: vuelve a la aproximación con 10 s menos de combustible y te multan.
-- **Separación por estela.** Tras un avión pesado (H) hay que esperar 6 s antes de un ligero (L), 4 s antes de un medio (M) y 3 s antes de otro pesado. Tras un medio, 3 s antes de un ligero. Si no la respetas, el avión opera igual pero te multan.
-- **Puertas limitadas.** Una llegada necesita puerta libre al terminar el rodaje y la ocupa 8 s de escala. Las salidas nacen en puerta: hay que sacarlas para hacer sitio.
-- **Combustible.** Si una llegada se queda sin combustible en aproximación, se desvía y no cobras.
-- Cuando la torre avisa de que no vienen más aviones, pulsa **Terminar el día**, luego **Cobrar** (pago menos multas) y compra mejoras en la tienda.
-- La automatización solo cubre tierra: el **Controlador de tierra** hace los push-back. Aterrizajes y despegues siempre son tuyos.
-- Las crisis (tormenta y emergencia médica) aparecen en algunos turnos y dan una bonificación en el cobro.
+- **Altitud de espera.** Al ordenar "mantenga X pies", el avión cambia de nivel y da vueltas en el sitio donde estaba. Varios aviones pueden esperar en el mismo punto a distinta altitud. Si dejas dos a la misma altitud y se cruzan (menos de 400 ft de diferencia), **chocan y pierdes todo el dinero**. Un anillo rojo avisa antes de que pase.
+- **Aproximación continua.** Al autorizar el aterrizaje, el avión vuela un tramo base, se alinea con la pista y desciende por la senda. Si al tocar la pista está ocupada, hace **motor y al aire** a 2500 ft y te multan.
+- **Separación por estela.** Tras un pesado (H) hay que esperar más antes de un ligero o medio. Si no la respetas, te multan.
+- **Puertas limitadas.** Una llegada necesita puerta libre y la ocupa 8 s de escala. Las salidas nacen en puerta.
+- **Combustible.** Si una llegada se queda sin combustible, se desvía y no cobras.
+- Cuando la torre avisa de que no vienen más aviones, pulsa **Terminar el día**, luego **Cobrar** y compra mejoras.
+- La automatización solo cubre tierra (push-back). Aterrizajes, altitudes y despegues siempre son tuyos.
 - El juego se guarda al cobrar y al empezar cada día. Un turno a medias se reinicia.
+
+## Fondo del mapa
+
+El tablero se dibuja por código. Si existe `assets/mapa.png` (1600×1000, mismo encuadre que el mundo del juego), se usa como fondo: ahí va la futura textura satelital.
 
 ## Estructura
 
 | Archivo | Qué hace |
 | --- | --- |
-| `scripts/game.gd` | Autoload `Game`: fases de cada avión, pistas, estela, puertas, cobro, tienda, eventos, guardado. Sin UI. |
-| `scripts/main.gd` | Interfaz construida por código: turno (radar + panel de radio), cobro y tienda. |
-| `scripts/radar_view.gd` | Dibuja el radar: pistas, terminal, barrido, aviones y estelas. Deriva posiciones de la fase de cada avión. |
+| `scripts/game.gd` | Autoload `Game`: simulación espacial (posición, rumbo, altitud), pistas, estela, puertas, colisiones, cobro, tienda, guardado. Sin UI. |
+| `scripts/main.gd` | Interfaz construida por código: turno (mapa + panel de radio), cobro y tienda. |
+| `scripts/map_view.gd` | Dibuja el tablero: suelo, pistas, rodaje, terminal, rutas, aviones con sombra según altitud y estelas. |
 | `tests/pacing_sim.gd` | Bots que juegan solos para medir el ritmo de la economía. |
 
 Todos los números de balance están en las constantes al principio de `game.gd`.
@@ -46,7 +50,7 @@ Todos los números de balance están en las constantes al principio de `game.gd`
 godot --headless --path . -s tests/pacing_sim.gd
 ```
 
-Resultado actual: los bots que respetan la estela llegan al primer prestigio el día 28 (25-31 min según su ritmo de órdenes). Un bot que ignora la estela acumula 56 infracciones hasta el día 30. Los bots planifican sin errores, así que un jugador real sufrirá más motores y al aire.
+Resultado actual: los bots llegan al primer prestigio hacia el día 32 (~60 min). Los bots asignan altitudes únicas y nunca se equivocan, así que un jugador real chocará y hará más motores y al aire.
 
 ## Exportar a web (itch.io)
 

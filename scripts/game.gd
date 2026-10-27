@@ -4,11 +4,13 @@ extends Node
 ##
 ## Bucle: turno de 9 a 18 (se coordinan los aviones pedidos ese día) -> cobro -> tienda -> siguiente día.
 ##
-## Cada avión pasa por fases como en una torre real:
-##   Llegada: aproximación -> final (autorizado a una pista) -> aterrizaje -> rodaje -> puerta.
-##   Salida:  puerta -> push-back y rodaje -> punto de espera -> alineado en pista -> despegue.
-## Una pista solo admite una operación a la vez, y tras cada operación hay que respetar
-## la separación por estela turbulenta según el tamaño del avión anterior y el siguiente.
+## Simulación espacial: cada avión tiene posición en el mapa (unidades de mundo), rumbo, velocidad
+## y altitud, y se mueve de forma continua.
+##   Llegada: entrante -> espera en círculo (a la altitud que ordenes) -> aproximación -> toma y
+##            carrera en pista -> rodaje -> puerta.
+##   Salida:  puerta -> push-back y rodaje -> punto de espera -> entra en pista -> despegue y ascenso.
+## Una pista solo admite una operación a la vez, tras cada operación hay que respetar la
+## separación por estela, y dos aviones en vuelo a la misma altitud y en el mismo sitio chocan.
 
 signal toast(text: String)
 
@@ -29,15 +31,46 @@ const SEPARATION := [
 	[6.0, 4.0, 3.0],
 ]
 const AIRLINES := ["IB", "VY", "UX", "AA", "LH", "AF", "KL", "LA", "AV", "AM"]
+
+# --- Geometría del aeropuerto (unidades de mundo) ---
+const MAP_SIZE := Vector2(1600, 1000)
+const RUNWAY_X0 := 590.0
+const RUNWAY_X1 := 1010.0
+const RUNWAY_Y0 := 440.0
+const RUNWAY_SPACING := 60.0
+const TAXI_Y := 490.0
+const GATE_Y := 528.0
+const GATE_X0 := 630.0
+const GATE_SPACING := 42.0
+const HOLD_POINT := Vector2(550, 490)
+const WAIT_GATE_POINT := Vector2(1070, 490)
+## Distancia del punto de entrada a final antes del umbral de pista.
+const FINAL_DIST := 260.0
+
+# --- Vuelo ---
+const HOLD_ALTITUDES := [3000, 4000, 5000, 6000, 7000]
+const GO_AROUND_ALT := 2500
+const SPAWN_ALTITUDES := [5000, 6000, 7000, 8000]
+const AIR_SPEED := 80.0
+const FINAL_SPEED := 60.0
+const TAXI_SPEED := 40.0
+const PUSHBACK_SPEED := 15.0
+const TAKEOFF_SPEED := 90.0
+const TURN_RATE := 1.6
+const CLIMB_RATE := 350.0
+const HOLD_RADIUS := 40.0
+## Si un entrante no recibe orden, entra en espera solo al llegar a esta distancia del aeropuerto.
+const AUTO_HOLD_DIST := 330.0
+## Separación mínima: menos que esto en horizontal y vertical es colisión.
+const CRASH_DIST := 16.0
+const CRASH_ALT := 400.0
+const CONFLICT_DIST := 70.0
+const CONFLICT_ALT := 900.0
+
 const BASE_PLANES_PER_DAY := 2
 const BASE_GATES := 2
-const FINAL_TIME := 6.0
-const LANDING_TIME := 3.0
-const TAKEOFF_TIME := 2.5
-const TAXI_TIME := 6.0
-const PUSHBACK_TIME := 3.0
+const MAX_GATES := 11
 const TURNAROUND_TIME := 8.0
-const GO_AROUND_FUEL := 10.0
 const MAX_RUNWAYS := 4
 const MILESTONES := [10, 25, 50, 100]
 const SHIFT_START := 9.0
@@ -50,14 +83,14 @@ const UPGRADES := {
 		"desc": "+1 avión por turno"},
 	"fees": {"name": "Tasas aeroportuarias", "base": 200.0, "growth": 1.4, "max": -1,
 		"desc": "+15 % de pago por avión"},
-	"gates": {"name": "Puerta de embarque", "base": 250.0, "growth": 1.6, "max": 7,
+	"gates": {"name": "Puerta de embarque", "base": 250.0, "growth": 1.6, "max": MAX_GATES - BASE_GATES - 2,
 		"desc": "+1 puerta para salidas y llegadas"},
 	"taxiway": {"name": "Calles de rodaje", "base": 300.0, "growth": 1.5, "max": 6,
-		"desc": "-15 % de tiempo de rodaje"},
+		"desc": "+15 % de velocidad de rodaje"},
 	"wake_monitor": {"name": "Monitor de estela", "base": 400.0, "growth": 1.0, "max": 1,
 		"desc": "Muestra la cuenta atrás de separación en cada pista"},
-	"rapid_exit": {"name": "Salida rápida de pista", "base": 500.0, "growth": 1.5, "max": 5,
-		"desc": "-10 % de ocupación de pista al aterrizar"},
+	"rapid_exit": {"name": "Salida rápida de pista", "base": 500.0, "growth": 1.5, "max": 4,
+		"desc": "Los aterrizajes dejan la pista antes"},
 	"runway": {"name": "Pista adicional", "base": 2500.0, "growth": 8.0, "max": MAX_RUNWAYS - 1,
 		"desc": "+1 pista"},
 	"radar": {"name": "Radar", "base": 800.0, "growth": 6.0, "max": 3,
@@ -92,8 +125,8 @@ var phase := Phase.SHOP
 ## Todos los aviones activos del turno, en orden de llegada.
 var planes: Array = []
 var runways: Array = []
-## Segundos restantes de escala de los aviones llegados que aún ocupan puerta.
-var turnarounds: Array = []
+## Una entrada por puerta: {"plane": id o -1, "turn": segundos de escala restantes}.
+var gates: Array = []
 var planes_total := 0
 var planes_spawned := 0
 var shift_elapsed := 0.0
@@ -105,6 +138,7 @@ var day_departed := 0
 var day_diverted := 0
 var day_go_arounds := 0
 var day_infractions := 0
+var day_crashes := 0
 var day_bonus := 0.0
 var last_summary := {}
 var _spawn_interval := 0.0
@@ -155,10 +189,7 @@ func reset_run() -> void:
 # --- Fórmulas -------------------------------------------------------------
 
 func planes_per_day() -> int:
-	var n: int = BASE_PLANES_PER_DAY + levels["traffic"]
-	if tree_owned.get("extra_traffic", false):
-		n += 2
-	return n
+	return BASE_PLANES_PER_DAY + levels["traffic"]
 
 
 func runway_count() -> int:
@@ -169,28 +200,24 @@ func gate_count() -> int:
 	var n: int = BASE_GATES + levels["gates"]
 	if tree_owned.get("extra_gates", false):
 		n += 2
-	return n
+	return min(n, MAX_GATES)
 
 
 func gates_used() -> int:
-	var n := turnarounds.size()
-	for p in planes:
-		if p["state"] == "gate":
+	var n := 0
+	for g in gates:
+		if g["plane"] >= 0 or g["turn"] > 0.0:
 			n += 1
 	return n
 
 
-func taxi_time() -> float:
-	return TAXI_TIME * pow(0.85, levels["taxiway"])
+func taxi_speed() -> float:
+	return TAXI_SPEED * pow(1.15, levels["taxiway"])
 
 
-func landing_time() -> float:
-	var t: float = LANDING_TIME * pow(0.9, levels["rapid_exit"])
-	return t * (1.5 if event_id == "storm" else 1.0)
-
-
-func takeoff_time() -> float:
-	return TAKEOFF_TIME * (1.5 if event_id == "storm" else 1.0)
+## Punto de la pista donde los aterrizajes la abandonan; la salida rápida lo adelanta.
+func runway_exit_x() -> float:
+	return RUNWAY_X1 - 50.0 * levels["rapid_exit"]
 
 
 ## Multiplica x2 el efecto en cada hito (10, 25, 50, 100 unidades).
@@ -252,12 +279,19 @@ func planes_pending() -> int:
 func shift_done() -> bool:
 	if phase != Phase.SHIFT or planes_spawned < planes_total or event_id != "":
 		return false
-	if not planes.is_empty():
-		return false
-	for r in runways:
-		if not r["op"].is_empty():
-			return false
-	return true
+	return planes.is_empty()
+
+
+func runway_y(i: int) -> float:
+	return RUNWAY_Y0 - i * RUNWAY_SPACING
+
+
+func threshold(i: int) -> Vector2:
+	return Vector2(RUNWAY_X0, runway_y(i))
+
+
+func gate_pos(k: int) -> Vector2:
+	return Vector2(GATE_X0 + k * GATE_SPACING, GATE_Y)
 
 
 ## Segundos de separación que aún faltan en una pista para un avión de la categoría dada.
@@ -268,10 +302,14 @@ func separation_left(runway: int, wake: int) -> float:
 	return max(0.0, SEPARATION[r["prev_wake"]][wake] - r["since"])
 
 
-## Una pista está libre si no hay nadie rodando por ella ni alineado.
+## Una pista está libre si no hay nadie rodando por ella ni entrando o alineado.
 func runway_clear(runway: int) -> bool:
 	var r: Dictionary = runways[runway]
 	return r["op"].is_empty() and r["lined"].is_empty()
+
+
+func is_airborne(p: Dictionary) -> bool:
+	return p["state"] in ["inbound", "holding", "approach", "go_around", "divert", "climb"]
 
 
 func arrivals() -> Array:
@@ -282,22 +320,44 @@ func departures() -> Array:
 	return planes.filter(func(p): return not p["arrival"])
 
 
-## Aviones en final hacia una pista (autorizados a aterrizar y aún en el aire).
-func finals_on(runway: int) -> Array:
-	return planes.filter(func(p): return p["state"] == "final" and p["runway"] == runway)
+## Aviones en aproximación hacia una pista.
+func approaches_on(runway: int) -> Array:
+	return planes.filter(func(p): return p["state"] == "approach" and p["runway"] == runway)
+
+
+## Segundos estimados hasta la toma de un avión en aproximación.
+func time_to_touchdown(p: Dictionary) -> float:
+	var d := 0.0
+	var at: Vector2 = p["pos"]
+	for w in p["path"]:
+		d += at.distance_to(w)
+		at = w
+	return d / FINAL_SPEED
 
 
 # --- Acciones del jugador: turno -------------------------------------------
 
-## Autoriza a un avión en aproximación a aterrizar en una pista. Toca pista en FINAL_TIME s;
-## si para entonces la pista está ocupada, hace motor y al aire.
+## Ordena esperar en círculo, donde está ahora, a una altitud dada. Sirve también para
+## cambiar la altitud de un avión que ya está en espera.
+func hold_at(plane_id: int, altitude: int) -> bool:
+	var p := _find(plane_id)
+	if p.is_empty() or not p["state"] in ["inbound", "holding"]:
+		return false
+	p["target_alt"] = float(altitude)
+	if p["state"] == "inbound":
+		_enter_hold(p)
+	return true
+
+
+## Autoriza el aterrizaje: el avión deja la espera y sigue la trayectoria hasta el umbral.
+## Si al llegar la pista está ocupada, hace motor y al aire.
 func clear_landing(plane_id: int, runway: int) -> bool:
 	var p := _find(plane_id)
-	if p.is_empty() or p["state"] != "approach" or runway < 0 or runway >= runways.size():
+	if p.is_empty() or not p["state"] in ["inbound", "holding"] or runway < 0 or runway >= runways.size():
 		return false
-	p["state"] = "final"
+	p["state"] = "approach"
 	p["runway"] = runway
-	p["timer"] = FINAL_TIME
+	p["path"] = _approach_path(p["pos"], runway)
 	return true
 
 
@@ -306,20 +366,24 @@ func push_back(plane_id: int) -> bool:
 	var p := _find(plane_id)
 	if p.is_empty() or p["state"] != "gate":
 		return false
-	p["state"] = "taxi_out"
-	p["timer"] = PUSHBACK_TIME + taxi_time()
+	gates[p["gate"]]["plane"] = -1
+	var g := gate_pos(p["gate"])
+	p["gate"] = -1
+	p["state"] = "pushback"
+	p["path"] = [Vector2(g.x, TAXI_Y), HOLD_POINT]
 	return true
 
 
-## Entrar y esperar: el avión ocupa la pista hasta que se le autorice el despegue.
+## Entrar y esperar: el avión rueda hasta el umbral y ocupa la pista hasta que despegue.
 func line_up(plane_id: int, runway: int) -> bool:
 	var p := _find(plane_id)
-	if p.is_empty() or p["state"] != "holding" or runway < 0 or runway >= runways.size():
+	if p.is_empty() or p["state"] != "hold_point" or runway < 0 or runway >= runways.size():
 		return false
 	if not runway_clear(runway):
 		return false
-	p["state"] = "lined_up"
+	p["state"] = "line_up"
 	p["runway"] = runway
+	p["path"] = [Vector2(RUNWAY_X0 - 30, runway_y(runway)), threshold(runway) + Vector2(6, 0)]
 	runways[runway]["lined"] = p
 	return true
 
@@ -335,8 +399,8 @@ func clear_takeoff(plane_id: int) -> bool:
 		_infraction(p, "despegó sin separación por estela")
 	r["lined"] = {}
 	r["op"] = p
-	r["op_left"] = takeoff_time()
 	p["state"] = "takeoff"
+	p["speed"] = 0.0
 	return true
 
 
@@ -345,16 +409,18 @@ func clear_takeoff(plane_id: int) -> bool:
 func start_shift() -> void:
 	phase = Phase.SHIFT
 	planes.clear()
-	turnarounds.clear()
 	runways.clear()
 	for i in runway_count():
-		runways.append({"op": {}, "op_left": 0.0, "lined": {}, "prev_wake": -1, "since": 0.0})
+		runways.append({"op": {}, "lined": {}, "prev_wake": -1, "since": 0.0})
+	gates.clear()
+	for k in gate_count():
+		gates.append({"plane": -1, "turn": 0.0})
 	planes_total = planes_per_day()
 	planes_spawned = 0
-	_spawn_interval = clamp(24.0 / planes_total, 1.5, 6.0)
+	_spawn_interval = clamp(30.0 / planes_total, 3.0, 8.0)
 	_spawn_timer = 0.5
 	shift_elapsed = 0.0
-	shift_length = _spawn_interval * planes_total + 25.0
+	shift_length = _spawn_interval * planes_total + 60.0
 	day_pay = 0.0
 	day_fines = 0.0
 	day_landed = 0
@@ -362,6 +428,7 @@ func start_shift() -> void:
 	day_diverted = 0
 	day_go_arounds = 0
 	day_infractions = 0
+	day_crashes = 0
 	day_bonus = 0.0
 	_done_announced = false
 	event_id = ""
@@ -378,7 +445,7 @@ func end_day() -> bool:
 		day_bonus += day_pay * 0.5
 	last_summary = {
 		"day": day, "landed": day_landed, "departed": day_departed, "diverted": day_diverted,
-		"go_arounds": day_go_arounds, "infractions": day_infractions,
+		"go_arounds": day_go_arounds, "infractions": day_infractions, "crashes": day_crashes,
 		"pay": day_pay, "bonus": day_bonus, "fines": day_fines,
 		"total": max(0.0, day_pay + day_bonus - day_fines),
 	}
@@ -447,9 +514,14 @@ func simulate(delta: float) -> void:
 	if phase != Phase.SHIFT:
 		return
 	shift_elapsed += delta
-	_update_runways(delta)
-	_update_planes(delta)
-	_update_turnarounds(delta)
+	for r in runways:
+		r["since"] += delta
+	for g in gates:
+		g["turn"] = max(0.0, g["turn"] - delta)
+	for p in planes.duplicate():
+		if planes.has(p):
+			_update_plane(p, delta)
+	_check_separation()
 	_spawn(delta)
 	_ground_control()
 	_update_event(delta)
@@ -465,65 +537,167 @@ func _find(plane_id: int) -> Dictionary:
 	return {}
 
 
-func _update_runways(delta: float) -> void:
-	for r in runways:
-		r["since"] += delta
-		if r["op"].is_empty():
-			continue
-		r["op_left"] -= delta
-		if r["op_left"] > 0.0:
-			continue
-		var p: Dictionary = r["op"]
-		r["op"] = {}
-		r["prev_wake"] = p["wake"]
-		r["since"] = 0.0
-		if p["arrival"]:
-			p["state"] = "taxi_in"
-			p["timer"] = taxi_time()
+func _update_plane(p: Dictionary, delta: float) -> void:
+	p["wait"] += delta
+	if p["arrival"] and is_airborne(p) and p["state"] != "divert":
+		p["fuel"] -= delta
+		if p["fuel"] <= 0.0:
+			_divert(p)
+	_update_altitude(p, delta)
+	match p["state"]:
+		"inbound":
+			_fly_toward(p, MAP_SIZE * 0.5, AIR_SPEED, delta)
+			if p["pos"].distance_to(MAP_SIZE * 0.5) < AUTO_HOLD_DIST:
+				_enter_hold(p)
+		"holding":
+			_orbit(p, delta)
+		"approach":
+			if _fly_path(p, FINAL_SPEED, delta):
+				_touchdown(p)
+			else:
+				_glide_slope(p, delta)
+		"landing":
+			# Carrera de aterrizaje: frena hasta velocidad de rodaje y abandona la pista en la salida.
+			p["speed"] = max(taxi_speed(), p["speed"] - 20.0 * delta)
+			p["pos"].x += p["speed"] * delta
+			if p["pos"].x >= runway_exit_x():
+				_vacate_runway(p)
+		"taxi_in":
+			if _move_path(p, taxi_speed(), delta):
+				_arrive_gate_or_wait(p)
+		"wait_gate":
+			_arrive_gate_or_wait(p)
+		"pushback":
+			var speed := PUSHBACK_SPEED if p["pos"].y > TAXI_Y + 1.0 else taxi_speed()
+			if _move_path(p, speed, delta):
+				p["state"] = "hold_point"
+		"hold_point":
+			pass
+		"line_up":
+			if _move_path(p, taxi_speed() * 0.6, delta):
+				p["state"] = "lined_up"
+				p["heading"] = 0.0
+		"takeoff":
+			p["speed"] = min(TAKEOFF_SPEED, p["speed"] + 32.0 * delta)
+			p["pos"].x += p["speed"] * delta
+			if p["pos"].x >= RUNWAY_X1:
+				_liftoff(p)
+		"climb", "divert":
+			_fly_toward(p, p["exit"], AIR_SPEED * 1.2, delta)
+			if p["pos"].distance_to(p["exit"]) < 20.0 or not Rect2(Vector2(-80, -80), MAP_SIZE + Vector2(160, 160)).has_point(p["pos"]):
+				if p["state"] == "climb":
+					_pay(p)
+					day_departed += 1
+				planes.erase(p)
+		"go_around":
+			if _fly_path(p, AIR_SPEED, delta):
+				p["target_alt"] = float(GO_AROUND_ALT)
+				_enter_hold(p)
+
+
+func _update_altitude(p: Dictionary, delta: float) -> void:
+	if p["state"] == "approach":
+		return
+	var diff: float = p["target_alt"] - p["alt"]
+	p["alt"] += clamp(diff, -CLIMB_RATE * delta, CLIMB_RATE * delta)
+
+
+## Senda de planeo: 1500 ft al entrar en final y 0 en el umbral.
+func _glide_slope(p: Dictionary, delta: float) -> void:
+	var t := threshold(p["runway"])
+	if p["path"].size() <= 1:
+		p["alt"] = min(p["alt"], 1500.0 * clamp(p["pos"].distance_to(t) / FINAL_DIST, 0.0, 1.0))
+	else:
+		p["alt"] = move_toward(p["alt"], 1500.0, CLIMB_RATE * delta)
+
+
+## Trayectoria de aproximación: si viene del lado contrario, tramo base al costado de la pista;
+## luego punto de entrada a final alineado con la pista, y el umbral.
+func _approach_path(from: Vector2, runway: int) -> Array:
+	var t := threshold(runway)
+	var join := t - Vector2(FINAL_DIST, 0)
+	var path := []
+	if from.x > join.x + 40.0:
+		var side := 1.0 if from.y >= t.y else -1.0
+		path.append(Vector2(from.x, t.y + side * 190.0) if from.x < RUNWAY_X1 else Vector2(RUNWAY_X1, t.y + side * 190.0))
+		path.append(Vector2(join.x - 60.0, t.y + side * 190.0))
+		path.append(Vector2(join.x - 90.0, t.y + side * 70.0))
+	path.append(join)
+	path.append(t)
+	return path
+
+
+## Vuelo con giro limitado hacia un punto (las trayectorias son curvas, sin saltos).
+func _fly_toward(p: Dictionary, target: Vector2, speed: float, delta: float) -> void:
+	var want: float = (target - p["pos"]).angle()
+	var diff := wrapf(want - p["heading"], -PI, PI)
+	p["heading"] += clamp(diff, -TURN_RATE * delta, TURN_RATE * delta)
+	p["speed"] = speed
+	p["pos"] += Vector2.from_angle(p["heading"]) * speed * delta
+
+
+## Sigue una ruta en vuelo; devuelve true al llegar al último punto.
+func _fly_path(p: Dictionary, speed: float, delta: float) -> bool:
+	if p["path"].is_empty():
+		return true
+	var target: Vector2 = p["path"][0]
+	_fly_toward(p, target, speed, delta)
+	# Un punto intermedio se da por alcanzado dentro del radio de giro, para no orbitar a su
+	# alrededor; el último (umbral de pista) al cruzarlo.
+	var reach: float = speed / TURN_RATE * 1.2
+	var last: bool = p["path"].size() == 1 and p["state"] == "approach"
+	var passed: bool = last and p["pos"].x >= target.x - 2.0 and abs(p["pos"].y - target.y) < 30.0
+	if passed or (not last and p["pos"].distance_to(target) < reach):
+		p["path"].pop_front()
+		if p["path"].is_empty():
+			p["pos"] = target
+			return true
+	return false
+
+
+## Movimiento en tierra por tramos rectos a velocidad constante.
+func _move_path(p: Dictionary, speed: float, delta: float) -> bool:
+	var step := speed * delta
+	p["speed"] = speed
+	while step > 0.0 and not p["path"].is_empty():
+		var target: Vector2 = p["path"][0]
+		var to: Vector2 = target - p["pos"]
+		if to.length() > 0.01:
+			p["heading"] = to.angle()
+		if to.length() <= step:
+			p["pos"] = target
+			step -= to.length()
+			p["path"].pop_front()
 		else:
-			_pay(p)
-			day_departed += 1
-			planes.erase(p)
+			p["pos"] += to.normalized() * step
+			step = 0.0
+	return p["path"].is_empty()
 
 
-func _update_planes(delta: float) -> void:
-	for p in planes.duplicate():
-		p["wait"] += delta
-		match p["state"]:
-			"approach":
-				p["fuel"] -= delta
-				if p["fuel"] <= 0.0:
-					_divert(p)
-			"final":
-				p["fuel"] -= delta
-				p["timer"] -= delta
-				if p["timer"] <= 0.0:
-					_touchdown(p)
-			"taxi_in":
-				p["timer"] -= delta
-				if p["timer"] <= 0.0:
-					p["state"] = "wait_gate"
-			"taxi_out":
-				p["timer"] -= delta
-				if p["timer"] <= 0.0:
-					p["state"] = "holding"
-		if p["state"] == "wait_gate" and gates_used() < gate_count():
-			_pay(p)
-			day_landed += 1
-			turnarounds.append(TURNAROUND_TIME)
-			planes.erase(p)
-			if p["emergency"] and event_id == "emergency":
-				_end_event(true, plane_value(p) * 3.0)
+## Entra en espera describiendo círculos a derechas alrededor de un punto junto a su posición.
+func _enter_hold(p: Dictionary) -> void:
+	p["state"] = "holding"
+	p["runway"] = -1
+	p["path"] = []
+	p["hold_center"] = p["pos"] + Vector2.from_angle(p["heading"] + PI / 2.0) * HOLD_RADIUS
+	p["hold_angle"] = (p["pos"] - p["hold_center"]).angle()
+
+
+func _orbit(p: Dictionary, delta: float) -> void:
+	p["hold_angle"] += AIR_SPEED / HOLD_RADIUS * delta
+	p["pos"] = p["hold_center"] + Vector2.from_angle(p["hold_angle"]) * HOLD_RADIUS
+	p["heading"] = p["hold_angle"] + PI / 2.0
+	p["speed"] = AIR_SPEED
 
 
 func _touchdown(p: Dictionary) -> void:
 	var runway: int = p["runway"]
-	var r: Dictionary = runways[runway]
 	if not runway_clear(runway):
-		# Pista ocupada: motor y al aire, vuelve a la aproximación con menos combustible.
-		p["state"] = "approach"
+		# Pista ocupada: motor y al aire, sube a la altitud de frustrada y vuelve a esperar.
+		p["state"] = "go_around"
+		p["target_alt"] = float(GO_AROUND_ALT)
+		p["path"] = [threshold(runway) + Vector2(260, -120)]
 		p["runway"] = -1
-		p["fuel"] -= GO_AROUND_FUEL
 		day_go_arounds += 1
 		day_fines += plane_value(p) * 0.25
 		if event_id == "storm":
@@ -533,8 +707,91 @@ func _touchdown(p: Dictionary) -> void:
 	if separation_left(runway, p["wake"]) > 0.0:
 		_infraction(p, "aterrizó sin separación por estela")
 	p["state"] = "landing"
-	r["op"] = p
-	r["op_left"] = landing_time()
+	p["alt"] = 0.0
+	p["target_alt"] = 0.0
+	p["heading"] = 0.0
+	p["speed"] = FINAL_SPEED * (0.75 if event_id == "storm" else 1.0)
+	runways[runway]["op"] = p
+
+
+func _release_runway(p: Dictionary) -> void:
+	var r: Dictionary = runways[p["runway"]]
+	r["op"] = {}
+	r["prev_wake"] = p["wake"]
+	r["since"] = 0.0
+
+
+func _vacate_runway(p: Dictionary) -> void:
+	_release_runway(p)
+	var exit_x := runway_exit_x() + 20.0
+	p["state"] = "taxi_in"
+	p["path"] = [Vector2(exit_x, p["pos"].y), Vector2(exit_x, TAXI_Y), WAIT_GATE_POINT]
+	p["gate"] = -1
+
+
+## Al terminar el rodaje busca puerta; si no hay, espera en la calle de rodaje.
+func _arrive_gate_or_wait(p: Dictionary) -> void:
+	if p["gate"] >= 0:
+		_pay(p)
+		day_landed += 1
+		gates[p["gate"]]["plane"] = -1
+		gates[p["gate"]]["turn"] = TURNAROUND_TIME
+		planes.erase(p)
+		if p["emergency"] and event_id == "emergency":
+			_end_event(true, plane_value(p) * 3.0)
+		return
+	var k := _free_gate()
+	if k < 0:
+		p["state"] = "wait_gate"
+		return
+	gates[k]["plane"] = p["id"]
+	p["gate"] = k
+	p["state"] = "taxi_in"
+	var g := gate_pos(k)
+	p["path"] = [Vector2(g.x, TAXI_Y), g]
+
+
+func _free_gate() -> int:
+	for k in gates.size():
+		if gates[k]["plane"] < 0 and gates[k]["turn"] <= 0.0:
+			return k
+	return -1
+
+
+func _liftoff(p: Dictionary) -> void:
+	_release_runway(p)
+	p["state"] = "climb"
+	p["target_alt"] = 6000.0
+	p["exit"] = Vector2(MAP_SIZE.x + 60, p["pos"].y - 250)
+
+
+func _check_separation() -> void:
+	var air := planes.filter(func(p): return is_airborne(p) and p["alt"] > 50.0)
+	for p in air:
+		p["conflict"] = false
+	for i in air.size():
+		for j in range(i + 1, air.size()):
+			var a: Dictionary = air[i]
+			var b: Dictionary = air[j]
+			var d: float = a["pos"].distance_to(b["pos"])
+			var dalt: float = abs(a["alt"] - b["alt"])
+			if d < CRASH_DIST and dalt < CRASH_ALT:
+				_crash(a, b)
+				return
+			if d < CONFLICT_DIST and dalt < CONFLICT_ALT:
+				a["conflict"] = true
+				b["conflict"] = true
+
+
+## Colisión en vuelo: se pierden los dos aviones y todo el dinero.
+func _crash(a: Dictionary, b: Dictionary) -> void:
+	planes.erase(a)
+	planes.erase(b)
+	day_crashes += 1
+	money = 0.0
+	day_pay = 0.0
+	day_bonus = 0.0
+	toast.emit("COLISIÓN entre %s y %s a %d ft. Pierdes todo el dinero." % [a["callsign"], b["callsign"], int(a["alt"])])
 
 
 func _infraction(p: Dictionary, what: String) -> void:
@@ -543,31 +800,29 @@ func _infraction(p: Dictionary, what: String) -> void:
 	toast.emit("Infracción: %s %s. Multa de %s $." % [p["callsign"], what, format_number(plane_value(p) * 0.5)])
 
 
+## Sin combustible: se desvía a otro aeropuerto saliendo del mapa.
 func _divert(p: Dictionary) -> void:
-	planes.erase(p)
+	if p["state"] == "approach" and not p["path"].is_empty():
+		return
+	p["state"] = "divert"
+	p["exit"] = p["pos"] + (p["pos"] - MAP_SIZE * 0.5).normalized() * 900.0
+	p["runway"] = -1
 	if p["emergency"]:
 		if event_id == "emergency":
 			_end_event(false, 0.0)
-		return
-	day_diverted += 1
-	if event_id == "storm":
-		event_success = false
-	toast.emit("%s se desvió por falta de combustible." % p["callsign"])
+	else:
+		day_diverted += 1
+		if event_id == "storm":
+			event_success = false
+	toast.emit("%s se desvía por falta de combustible." % p["callsign"])
 
 
-## Paga un avión; las salidas pierden un 10 % por cada 10 s de espera por encima de 30 s.
+## Paga un avión; pierde un 10 % por cada 10 s de espera por encima del margen.
 func _pay(p: Dictionary) -> void:
 	var pay := plane_value(p)
-	var late: float = max(0.0, p["wait"] - (60.0 if p["arrival"] else 30.0))
+	var late: float = max(0.0, p["wait"] - (90.0 if p["arrival"] else 45.0))
 	pay *= max(0.3, 1.0 - 0.1 * floor(late / 10.0))
 	day_pay += pay
-
-
-func _update_turnarounds(delta: float) -> void:
-	for i in range(turnarounds.size() - 1, -1, -1):
-		turnarounds[i] -= delta
-		if turnarounds[i] <= 0.0:
-			turnarounds.remove_at(i)
 
 
 func _spawn(delta: float) -> void:
@@ -577,8 +832,9 @@ func _spawn(delta: float) -> void:
 	if _spawn_timer > 0.0:
 		return
 	# Las salidas nacen en una puerta: si no hay puerta libre, llega una llegada en su lugar.
-	var is_arrival := rng.randf() < 0.5 or gates_used() >= gate_count()
-	planes.append(_make_plane(is_arrival, false))
+	var gate := _free_gate()
+	var is_arrival := rng.randf() < 0.5 or gate < 0
+	planes.append(_make_plane(is_arrival, false, gate))
 	planes_spawned += 1
 	# Llegan en oleadas irregulares, como los bancos de un aeropuerto real.
 	_spawn_timer = _spawn_interval * rng.randf_range(0.3, 1.7)
@@ -586,7 +842,7 @@ func _spawn(delta: float) -> void:
 		toast.emit("Último avión del día en camino.")
 
 
-func _make_plane(is_arrival: bool, emergency: bool) -> Dictionary:
+func _make_plane(is_arrival: bool, emergency: bool, gate: int = -1) -> Dictionary:
 	# Con más radar, la mayoría de aviones son del tamaño máximo desbloqueado.
 	var tier: int = levels["radar"]
 	if tier > 0 and rng.randf() < 0.4:
@@ -597,15 +853,35 @@ func _make_plane(is_arrival: bool, emergency: bool) -> Dictionary:
 		"arrival": is_arrival,
 		"tier": tier,
 		"model": MODEL_BY_RADAR[tier],
-		"pax": PAX_BY_RADAR[tier],
 		"wake": WAKE_BY_RADAR[tier],
-		"state": "approach" if is_arrival else "gate",
-		"timer": 0.0,
+		"pax": PAX_BY_RADAR[tier],
 		"runway": -1,
-		"fuel": 15.0 if emergency else rng.randf_range(20.0, 35.0),
+		"gate": -1,
+		"path": [],
+		"speed": 0.0,
+		"heading": 0.0,
+		"alt": 0.0,
+		"target_alt": 0.0,
+		"fuel": 40.0 if emergency else rng.randf_range(60.0, 90.0),
 		"wait": 0.0,
 		"emergency": emergency,
+		"conflict": false,
 	}
+	if is_arrival:
+		# Entra por un borde del mapa, rumbo al aeropuerto, a una altitud de crucero.
+		var a := rng.randf_range(0.0, TAU)
+		plane["pos"] = MAP_SIZE * 0.5 + Vector2(cos(a) * MAP_SIZE.x * 0.5, sin(a) * MAP_SIZE.y * 0.5) * 0.98
+		plane["heading"] = (MAP_SIZE * 0.5 - plane["pos"]).angle()
+		plane["alt"] = float(SPAWN_ALTITUDES[rng.randi() % SPAWN_ALTITUDES.size()])
+		plane["target_alt"] = plane["alt"]
+		plane["state"] = "inbound"
+		plane["speed"] = AIR_SPEED
+	else:
+		gates[gate]["plane"] = _next_plane_id
+		plane["gate"] = gate
+		plane["pos"] = gate_pos(gate)
+		plane["heading"] = -PI / 2.0
+		plane["state"] = "gate"
 	_next_plane_id += 1
 	return plane
 
@@ -614,13 +890,13 @@ func _make_plane(is_arrival: bool, emergency: bool) -> Dictionary:
 func _ground_control() -> void:
 	if levels["ground"] == 0:
 		return
-	var holding := planes.filter(func(p): return p["state"] in ["taxi_out", "holding"]).size()
+	var queued := planes.filter(func(p): return p["state"] in ["pushback", "hold_point"]).size()
 	for p in planes:
-		if holding >= runways.size() + 1:
+		if queued >= runways.size() + 1:
 			return
 		if p["state"] == "gate":
 			push_back(p["id"])
-			holding += 1
+			queued += 1
 
 
 # --- Eventos de crisis -----------------------------------------------------
@@ -647,10 +923,10 @@ func _start_event(id: String) -> void:
 	event_success = true
 	match id:
 		"storm":
-			event_time = 25.0
-			toast.emit("Tormenta: las pistas tardan un 50 % más durante 25 s. Sin desvíos ni motores y al aire, +50 % de pago hoy.")
+			event_time = 30.0
+			toast.emit("Tormenta: las tomas son más lentas durante 30 s. Sin desvíos ni motores y al aire, +50 % de pago hoy.")
 		"emergency":
-			planes.push_front(_make_plane(true, true))
+			planes.append(_make_plane(true, true))
 			toast.emit("Emergencia médica: aterriza el avión marcado antes de que se quede sin combustible.")
 
 
@@ -670,7 +946,7 @@ func _end_event(success: bool, bonus: float) -> void:
 ## Se guarda entre turnos; un turno a medias se reinicia al volver.
 func to_dict() -> Dictionary:
 	return {
-		"version": 3,
+		"version": 4,
 		"xp_available": xp_available, "xp_total": xp_total,
 		"airport_level": airport_level, "tree_owned": tree_owned,
 		"money": money, "run_money": run_money, "day": day, "levels": levels,
@@ -702,7 +978,7 @@ func load_game() -> bool:
 	if not FileAccess.file_exists(SAVE_PATH):
 		return false
 	var data = JSON.parse_string(FileAccess.get_file_as_string(SAVE_PATH))
-	if typeof(data) != TYPE_DICTIONARY or int(data.get("version", 0)) != 3:
+	if typeof(data) != TYPE_DICTIONARY or int(data.get("version", 0)) != 4:
 		return false
 	from_dict(data)
 	return true
