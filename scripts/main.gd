@@ -1,13 +1,18 @@
 extends Control
-## Interfaz de la torre con tres pantallas: turno, cobro y tienda.
-## Se construye por código para que el prototipo sea fácil de modificar; los botones se reutilizan
-## en vez de recrearse para no perder clics entre refrescos.
+## Interfaz de la torre con tres pantallas: turno (mapa + radio), cobro y tienda.
+## Se construye por código para que el prototipo sea fácil de modificar; los botones se
+## reutilizan en vez de recrearse para no perder clics entre refrescos.
 
 const COLOR_BG := Color("101820")
 const COLOR_ARRIVAL := Color("8ecbff")
 const COLOR_DEPARTURE := Color("9be89b")
 const COLOR_WARN := Color("ff6b5b")
 const COLOR_EMERGENCY := Color("ffb347")
+const COLOR_MUTED := Color("8a96a3")
+const TRAFFIC_ROWS := 14
+const RADIO_LINES := 8
+const MapView := preload("res://scripts/map_view.gd")
+const ACTION_BUTTONS := 10
 
 var _status_label: Label
 var _shift_view: VBoxContainer
@@ -18,11 +23,14 @@ var _shop_view: VBoxContainer
 var _clock_label: Label
 var _shift_info: Label
 var _event_label: Label
-var _vip_button: Button
 var _end_day_button: Button
-var _arrival_buttons: Array[Button] = []
-var _departure_buttons: Array[Button] = []
-var _runway_labels: Array[Label] = []
+var _radar: Control
+var _traffic_buttons: Array[Button] = []
+var _selected_label: Label
+var _action_buttons: Array[Button] = []
+var _radio_label: Label
+var _radio_log: Array[String] = []
+var _airport_label: Label
 
 # Cobro.
 var _summary_label: Label
@@ -67,7 +75,7 @@ func _build_ui() -> void:
 	add_child(margin)
 
 	var root := VBoxContainer.new()
-	root.add_theme_constant_override("separation", 12)
+	root.add_theme_constant_override("separation", 10)
 	margin.add_child(root)
 
 	_status_label = _label(root, "", 20)
@@ -86,26 +94,58 @@ func _build_shift_view(parent: Node) -> VBoxContainer:
 	top.add_theme_constant_override("separation", 32)
 	view.add_child(top)
 	_clock_label = _label(top, "", 28)
-	_shift_info = _label(top, "", 16)
+	_shift_info = _label(top, "", 15)
 
-	var event_row := HBoxContainer.new()
-	view.add_child(event_row)
-	_event_label = _label(event_row, "", 16)
+	_event_label = _label(view, "", 16)
 	_event_label.add_theme_color_override("font_color", COLOR_EMERGENCY)
-	_vip_button = Button.new()
-	_vip_button.text = "Reservar pista para el VIP"
-	_vip_button.pressed.connect(func(): Game.reserve_vip())
-	event_row.add_child(_vip_button)
 
-	var columns := HBoxContainer.new()
-	columns.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	columns.add_theme_constant_override("separation", 24)
-	view.add_child(columns)
-	_arrival_buttons = _strip_column(columns, "LLEGADAS")
-	_departure_buttons = _strip_column(columns, "SALIDAS")
-	var runway_col := _column(columns, "PISTAS")
-	for i in Game.MAX_RUNWAYS:
-		_runway_labels.append(_label(runway_col, "", 15))
+	var body := HBoxContainer.new()
+	body.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	body.add_theme_constant_override("separation", 12)
+	view.add_child(body)
+
+	_radar = MapView.new()
+	_radar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_radar.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_radar.plane_selected.connect(func(_id): pass)
+	body.add_child(_radar)
+
+	var side := VBoxContainer.new()
+	side.custom_minimum_size = Vector2(380, 0)
+	side.add_theme_constant_override("separation", 6)
+	body.add_child(side)
+
+	_label(side, "AVIÓN SELECCIONADO", 15)
+	_selected_label = _label(side, "", 14)
+	_selected_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	var actions := HFlowContainer.new()
+	side.add_child(actions)
+	for j in ACTION_BUTTONS:
+		var b := Button.new()
+		b.add_theme_font_size_override("font_size", 13)
+		b.pressed.connect(func(): _on_action(b))
+		actions.add_child(b)
+		_action_buttons.append(b)
+
+	_label(side, "RADIO", 15)
+	_radio_label = _label(side, "", 12)
+	_radio_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_radio_label.custom_minimum_size = Vector2(0, 150)
+	_radio_label.add_theme_color_override("font_color", Color(0.72, 1.0, 0.84))
+
+	_label(side, "TRÁFICO", 15)
+	var traffic := HFlowContainer.new()
+	side.add_child(traffic)
+	for i in TRAFFIC_ROWS:
+		var b := Button.new()
+		b.add_theme_font_size_override("font_size", 12)
+		b.pressed.connect(func(): _radar.selected_id = b.get_meta("plane_id", -1))
+		traffic.add_child(b)
+		_traffic_buttons.append(b)
+
+	_airport_label = _label(side, "", 12)
+	_airport_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_airport_label.add_theme_color_override("font_color", COLOR_MUTED)
 
 	_end_day_button = _big_button(view, "Terminar el día", func(): Game.end_day())
 	return view
@@ -148,7 +188,7 @@ func _build_shop_view(parent: Node) -> VBoxContainer:
 func _view(parent: Node) -> VBoxContainer:
 	var v := VBoxContainer.new()
 	v.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	v.add_theme_constant_override("separation", 12)
+	v.add_theme_constant_override("separation", 10)
 	parent.add_child(v)
 	return v
 
@@ -181,7 +221,7 @@ func _list_button(parent: Node, on_press: Callable) -> Button:
 func _big_button(parent: Node, text: String, on_press: Callable) -> Button:
 	var b := Button.new()
 	b.text = text
-	b.custom_minimum_size = Vector2(260, 48)
+	b.custom_minimum_size = Vector2(260, 44)
 	b.size_flags_horizontal = Control.SIZE_SHRINK_END
 	b.add_theme_font_size_override("font_size", 18)
 	b.pressed.connect(on_press)
@@ -189,18 +229,49 @@ func _big_button(parent: Node, text: String, on_press: Callable) -> Button:
 	return b
 
 
-## Crea un grupo fijo de botones-tira; cada uno lee en su metadato el id del avión que muestra.
-func _strip_column(parent: Node, title: String) -> Array[Button]:
-	var col := _column(parent, title)
-	var buttons: Array[Button] = []
-	for i in Game.MAX_QUEUE:
-		var b := Button.new()
-		b.alignment = HORIZONTAL_ALIGNMENT_LEFT
-		b.custom_minimum_size = Vector2(0, 40)
-		b.pressed.connect(func(): Game.approve(b.get_meta("plane_id", -1)))
-		col.add_child(b)
-		buttons.append(b)
-	return buttons
+## Ejecuta la orden guardada en el botón y la transmite por radio con la colación del piloto.
+func _on_action(b: Button) -> void:
+	var action: String = b.get_meta("action", "")
+	var p: Dictionary = Game._find(b.get_meta("plane_id", -1))
+	var runway: int = b.get_meta("runway", -1)
+	var altitude: int = b.get_meta("altitude", 0)
+	if p.is_empty():
+		return
+	var cs: String = p["callsign"]
+	var ok := false
+	var order := ""
+	var readback := ""
+	match action:
+		"hold":
+			ok = Game.hold_at(p["id"], altitude)
+			order = "%s, mantenga %d pies y espere en circuito donde está." % [cs, altitude]
+			readback = "Mantenemos %d pies en espera, %s." % [altitude, cs]
+		"land":
+			ok = Game.clear_landing(p["id"], runway)
+			order = "%s, pista %d, autorizado a aterrizar." % [cs, runway + 1]
+			readback = "Autorizado a aterrizar pista %d, %s." % [runway + 1, cs]
+		"push":
+			ok = Game.push_back(p["id"])
+			order = "%s, push-back aprobado, ruede al punto de espera." % cs
+			readback = "Push-back y rodaje al punto de espera, %s." % cs
+		"line_up":
+			ok = Game.line_up(p["id"], runway)
+			order = "%s, entre en pista %d y espere." % [cs, runway + 1]
+			readback = "Entrando en pista %d y esperando, %s." % [runway + 1, cs]
+		"takeoff":
+			ok = Game.clear_takeoff(p["id"])
+			order = "%s, pista %d, autorizado a despegar." % [cs, p["runway"] + 1]
+			readback = "Autorizado a despegar, %s." % cs
+	if ok:
+		_radio("TWR: " + order)
+		_radio(cs + ": " + readback)
+
+
+func _radio(line: String) -> void:
+	_radio_log.push_front(line)
+	if _radio_log.size() > RADIO_LINES:
+		_radio_log.pop_back()
+	_radio_label.text = "\n".join(_radio_log)
 
 
 # --- Refresco --------------------------------------------------------------
@@ -224,44 +295,134 @@ func _refresh() -> void:
 func _refresh_shift() -> void:
 	var h := Game.clock_hours()
 	_clock_label.text = "%02d:%02d" % [int(h), int(fmod(h, 1.0) * 60.0)]
-	_shift_info.text = "Por llegar: %d de %d · Coordinados: %d · Desviados: %d · Por cobrar: %s $" % [
-		Game.planes_pending(), Game.planes_total, Game.day_landed, Game.day_diverted,
-		Game.format_number(Game.day_pay + Game.day_bonus)]
+	_shift_info.text = "Por llegar: %d de %d · Aterrizados: %d · Despegados: %d · Por cobrar: %s $ · Multas: %s $" % [
+		Game.planes_pending(), Game.planes_total, Game.day_landed, Game.day_departed,
+		Game.format_number(Game.day_pay + Game.day_bonus), Game.format_number(Game.day_fines)]
 
 	var event_text := ""
 	match Game.event_id:
-		"storm": event_text = "TORMENTA %ds · evita desvíos" % ceil(Game.event_time)
-		"emergency": event_text = "EMERGENCIA · aprueba el avión naranja"
-		"vip": event_text = "VUELO VIP %ds · reserva una pista" % ceil(Game.event_time)
+		"storm": event_text = "TORMENTA %ds · las tomas son más lentas, evita desvíos y motores y al aire" % ceil(Game.event_time)
+		"emergency": event_text = "EMERGENCIA · aterriza el avión naranja cuanto antes"
 	if Game.shift_done():
 		event_text = "Torre: no vienen más aviones hoy. Puedes terminar el día."
 	_event_label.text = event_text
-	_vip_button.visible = Game.event_id == "vip"
 	_end_day_button.disabled = not Game.shift_done()
 
-	_fill_strips(_arrival_buttons, Game.arrivals, COLOR_ARRIVAL)
-	_fill_strips(_departure_buttons, Game.departures, COLOR_DEPARTURE)
-
-	for i in _runway_labels.size():
-		var l := _runway_labels[i]
-		if i >= Game.runways.size():
-			l.text = "Pista %d · cerrada" % (i + 1)
-			continue
+	_refresh_selected()
+	_refresh_traffic()
+	var lines := []
+	for i in Game.runways.size():
 		var r: Dictionary = Game.runways[i]
-		if r["vip"]:
-			l.text = "Pista %d · reservada VIP %.1fs" % [i + 1, r["time_left"]]
-		elif r["time_left"] > 0.0:
-			l.text = "Pista %d · %s %.1fs" % [i + 1, r["plane"]["callsign"], r["time_left"]]
-		else:
-			l.text = "Pista %d · libre" % (i + 1)
+		var state := "libre"
+		if not r["op"].is_empty():
+			state = "ocupada por %s" % r["op"]["callsign"]
+		elif not r["lined"].is_empty():
+			state = "%s alineado" % r["lined"]["callsign"]
+		lines.append("P%d: %s" % [i + 1, state])
+	lines.append("Puertas ocupadas: %d de %d" % [Game.gates_used(), Game.gate_count()])
+	lines.append("Dos aviones en el mismo sitio y a la misma altitud chocan y pierdes todo el dinero; el círculo rojo avisa del conflicto. Estela: tras H esperar 6 s a L, 4 s a M y 3 s a H; tras M, 3 s a L.")
+	_airport_label.text = "\n".join(lines)
+
+
+func _refresh_selected() -> void:
+	var p: Dictionary = Game._find(_radar.selected_id)
+	if p.is_empty():
+		_selected_label.text = "Ninguno. Haz clic en un avión del radar o de la lista de tráfico."
+		_fill_actions(p)
+		return
+	var text := "%s · %s · estela %s\n%d pasajeros · paga %s $\n%s" % [
+		p["callsign"], p["model"], Game.WAKE_NAMES[p["wake"]], p["pax"],
+		Game.format_number(Game.plane_value(p)), _state_text(p)]
+	if p["emergency"]:
+		text += "\nEMERGENCIA MÉDICA: prioridad absoluta"
+	_selected_label.text = text
+	_fill_actions(p)
+
+
+func _refresh_traffic() -> void:
+	var planes := Game.planes
+	for i in _traffic_buttons.size():
+		var b := _traffic_buttons[i]
+		if i >= planes.size():
+			b.visible = false
+			continue
+		var p: Dictionary = planes[i]
+		b.visible = true
+		b.set_meta("plane_id", p["id"])
+		b.text = "%s %s" % ["▼" if p["arrival"] else "▲", p["callsign"]]
+		var c := COLOR_ARRIVAL if p["arrival"] else COLOR_DEPARTURE
+		if p["emergency"]:
+			c = COLOR_EMERGENCY
+		elif p["arrival"] and Game.is_airborne(p) and p["fuel"] < 15.0:
+			c = COLOR_WARN
+		b.add_theme_color_override("font_color", c)
+		b.add_theme_color_override("font_hover_color", c)
+
+
+func _state_text(p: Dictionary) -> String:
+	var alt := "%d ft" % int(round(p["alt"] / 100.0) * 100)
+	match p["state"]:
+		"inbound": return "entrante a %s, combustible %ds. Asígnale altitud de espera." % [alt, ceil(p["fuel"])]
+		"holding": return "en espera a %s (asignada %d), combustible %ds" % [alt, int(p["target_alt"]), ceil(p["fuel"])]
+		"approach": return "aproximación a P%d, %s, toma en %.0fs" % [p["runway"] + 1, alt, Game.time_to_touchdown(p)]
+		"go_around": return "motor y al aire, subiendo a %d ft" % Game.GO_AROUND_ALT
+		"landing": return "carrera de aterrizaje en P%d" % (p["runway"] + 1)
+		"taxi_in": return "rodando a puerta"
+		"wait_gate": return "esperando puerta libre"
+		"gate": return "en puerta, espera %ds" % int(p["wait"])
+		"pushback": return "push-back y rodaje al punto de espera"
+		"hold_point": return "en punto de espera"
+		"line_up": return "entrando en P%d" % (p["runway"] + 1)
+		"lined_up": return "alineado en P%d" % (p["runway"] + 1)
+		"takeoff": return "carrera de despegue en P%d" % (p["runway"] + 1)
+		"climb": return "despegado, ascenso a %s" % alt
+		"divert": return "desviándose a otro aeropuerto"
+	return p["state"]
+
+
+## Muestra solo las órdenes de radio posibles en la fase actual del avión seleccionado.
+func _fill_actions(p: Dictionary) -> void:
+	var actions := []
+	if not p.is_empty():
+		match p["state"]:
+			"inbound", "holding":
+				for alt in Game.HOLD_ALTITUDES:
+					actions.append(["hold", -1, "Esperar a %d ft" % alt, int(p["target_alt"]) != alt or p["state"] == "inbound", alt])
+				for r in Game.runways.size():
+					actions.append(["land", r, "Autorizar aterrizaje P%d" % (r + 1), true])
+			"gate":
+				actions.append(["push", -1, "Aprobar push-back", true])
+			"hold_point":
+				for r in Game.runways.size():
+					actions.append(["line_up", r, "Entrar y esperar P%d" % (r + 1), Game.runway_clear(r)])
+			"lined_up":
+				actions.append(["takeoff", -1, "Autorizar despegue", true])
+	for j in _action_buttons.size():
+		var b: Button = _action_buttons[j]
+		if j >= actions.size():
+			b.visible = false
+			continue
+		var a: Array = actions[j]
+		b.visible = true
+		b.text = a[2]
+		b.disabled = not a[3]
+		b.set_meta("action", a[0])
+		b.set_meta("plane_id", p["id"])
+		b.set_meta("runway", a[1])
+		b.set_meta("altitude", a[4] if a.size() > 4 else 0)
 
 
 func _refresh_payday() -> void:
 	var s: Dictionary = Game.last_summary
-	var text := "Día %d\n\nAviones coordinados: %d\nAviones desviados: %d\nPago por aviones: %s $" % [
-		s["day"], s["landed"], s["diverted"], Game.format_number(s["pay"])]
+	var text := "Día %d\n\nAterrizajes: %d\nDespegues: %d\nDesvíos: %d\nMotor y al aire: %d\nInfracciones de separación: %d\n\nPago por aviones: %s $" % [
+		s["day"], s["landed"], s["departed"], s["diverted"], s["go_arounds"], s["infractions"],
+		Game.format_number(s["pay"])]
 	if s["bonus"] > 0.0:
 		text += "\nBonificación por crisis: %s $" % Game.format_number(s["bonus"])
+	if s["fines"] > 0.0:
+		text += "\nMultas: -%s $" % Game.format_number(s["fines"])
+	if s["crashes"] > 0:
+		text += "\nColisiones: %d (se perdió todo el dinero)" % s["crashes"]
 	text += "\n\nTotal: %s $" % Game.format_number(s["total"])
 	_summary_label.text = text
 
@@ -292,26 +453,8 @@ func _display_level(id: String) -> int:
 	return Game.levels[id] + (1 if id == "traffic" else 0)
 
 
-func _fill_strips(buttons: Array[Button], queue: Array, color: Color) -> void:
-	for i in buttons.size():
-		var b := buttons[i]
-		if i >= queue.size():
-			b.visible = false
-			continue
-		var p: Dictionary = queue[i]
-		b.visible = true
-		b.set_meta("plane_id", p["id"])
-		var detail := "combustible %ds" % ceil(p["fuel"]) if p["arrival"] else "espera %ds" % int(p["wait"])
-		b.text = "%s   %s   %s $   %s" % [p["callsign"], p["model"], Game.format_number(Game.plane_value(p)), detail]
-		var c := color
-		if p["emergency"]:
-			c = COLOR_EMERGENCY
-		elif p["arrival"] and p["fuel"] < 10.0:
-			c = COLOR_WARN
-		b.add_theme_color_override("font_color", c)
-		b.add_theme_color_override("font_hover_color", c)
-
-
 func _on_toast(text: String) -> void:
 	_toast_label.text = text
 	_toast_time = 5.0
+	if Game.phase == Game.Phase.SHIFT:
+		_radio("TWR: " + text)
